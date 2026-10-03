@@ -2028,6 +2028,9 @@ def _chat_to_response(chat_resp: dict, req_model: str) -> dict:
 class _RespSSE:
     """chat SSE → Responses SSE 事件桥接（标准 OpenAI Responses 事件协议）。"""
 
+    # 上游错误原文里的 Team=<id> 是内部标识：原文只进日志，客户端整段打码
+    _TEAM_LEAK_RE = re.compile(r"Team=[0-9a-zA-Z-]*")
+
     def __init__(self, req_model: str):
         self.req_model = req_model
         self.rid = "resp_" + uuid.uuid4().hex[:24]
@@ -2036,6 +2039,9 @@ class _RespSSE:
         self.usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         self.msg_state = {"started": False, "text": ""}
         self.fc_state = {}     # tool index → {"started", "args", "name", "call_id"}
+        self.failed = False    # 上游流内已报错：finish 必须如实终结为 failed
+        self.error_msg = ""    # 上游错误原文（只进日志，不原样回客户端）
+        self.error_code = ""   # 上游错误 code（可空，缺省补 upstream_error）
 
     def ev(self, etype, payload):
         self.seq += 1
@@ -2059,10 +2065,22 @@ class _RespSSE:
         except Exception:
             return events
         if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+            # usage 提取必须在 error 判断之前：上游把 usage 与 error 放在
+            # 同一帧时，failed 事件载荷也要带上真实用量（展示用）
             u = chunk["usage"]
             self.usage = {"input_tokens": u.get("prompt_tokens", 0),
                           "output_tokens": u.get("completion_tokens", 0),
                           "total_tokens": u.get("total_tokens", 0)}
+        err = chunk.get("error")
+        if isinstance(err, dict) and err:
+            # 上游流内报错若被静默丢弃，finish 会照发 response.completed，
+            # 客户端拿到"成功"的空回复（静默假活）。如实记录后本帧不再产出内容事件。
+            self.failed = True
+            self.error_msg = str(err.get("message") or err.get("type")
+                                 or err.get("code") or "upstream error")
+            self.error_code = str(err.get("code") or "")
+            log.error("Responses 桥上游流内错误（%s）: %s", self.rid, self.error_msg)
+            return events
         for ch in chunk.get("choices") or []:
             delta = ch.get("delta") or {}
             txt = delta.get("content")
@@ -2102,8 +2120,21 @@ class _RespSSE:
         return events
 
     def finish(self):
-        """产出全部 done 事件 + response.completed。"""
+        """产出全部 done 事件 + response.completed；上游已报错则改发 response.failed。"""
         events = []
+        if self.failed:
+            # 已失败就不再补 done/completed 事件——把部分内容标成"已完成"同样是谎报
+            resp = self.base_resp("failed")
+            resp["error"] = {
+                # code 与 message 同样脱敏（原文只进日志）；先脱敏后截断，
+                # 保证替换后长度仍 ≤64
+                "code": self._TEAM_LEAK_RE.sub(
+                    "[redacted]", self.error_code or "upstream_error")[:64],
+                "message": self._TEAM_LEAK_RE.sub("[redacted]",
+                                                  self.error_msg[:300]),
+            }
+            events.append(self.ev("response.failed", {"response": resp}))
+            return events
         if self.msg_state["started"]:
             events.append(self.ev("response.output_text.done",
                                   {"item_id": "msg_0", "output_index": 0, "content_index": 0,
