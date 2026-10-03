@@ -241,6 +241,22 @@ UPSTREAM_429_MAX_WAIT_S = 120.0
 PROVIDER_QUOTA_COOLDOWN_S = 900.0
 _prov_quota_cooldown = {}   # provider name -> until_ts
 
+# ─── 流内嗅探门（T2 / 升级方案 v2 §3.1）────────────────────────────
+# 上游可能先吐 200 再在流内报错（data:{"error":...}）、或空流
+# （[DONE] 无内容、usage 后直接 DONE）——旧逻辑把垃圾透传给客户端，
+# 空流更让客户端拿到"成功空回复"而无限重试。在换号循环内、
+# return Response 之前同步 peek 前若干字节/事件：此时状态码未定，
+# 判负还能换号。
+GATE_MAX_BYTES = 32 * 1024   # peek 缓冲字节上限。缓冲上限为本仓自主
+                             # 选择（magpie firstMost=8MB；本仓取 32KB
+                             # 已覆盖头部若干 SSE 事件，避免长流被误判）
+GATE_MAX_EVENTS = 8          # peek 事件（data: 行）上限
+GATE_NO_EVENT_TIMEOUT = 20.0  # peek 期间"有字节但无内容事件"的秒数上限。
+                              # 审计注明（如实）：它只能在 chunk 之间生效——
+                              # httpx 无法在流中途改超时，上游完全静默时由
+                              # _stream_open 既有的 120s read 超时兜底
+                              # （读超时抛出 → 嗅探判负换号），不是回归
+
 
 class _UpstreamOpen:
     """一次上游请求的判定结果（流式开闸 / 非流式响应共用）。
@@ -258,6 +274,10 @@ class _UpstreamOpen:
         self.snippet = snippet
         self.retry_after = retry_after
         self.error = error
+        # 嗅探门续读用的 iter_bytes 生成器（仅 _peek_stream 判
+        # 健康后挂入；显式声明为 None——_stream_body 的 getattr
+        # 兜底因此只是防御，正常情况下不应走到）
+        self.peek_iter = None
 
     @property
     def ok(self) -> bool:
@@ -348,14 +368,194 @@ def _stream_open(data: dict, model: str, headers: dict) -> _UpstreamOpen:
         return _UpstreamOpen(status=status, snippet=snippet, retry_after=retry_after)
 
 
+def _feature_stream_gate() -> bool:
+    """流内嗅探门开关（features.stream_gate，键缺省视为开启）。
+
+    每请求现读 config——与 load_config().get("model_groups") 同风格，
+    改 config.json 不必重启即生效。
+    """
+    return load_config().get("features", {}).get("stream_gate", True)
+
+
+# 嗅探门内容判定的字段集（OpenAI 形流式帧，防御式逐字段取）
+_GATE_CONTENT_FIELDS = ("content", "refusal", "reasoning_content",
+                        "reasoning", "tool_calls", "function_call")
+
+
+def _gate_has_content(obj: dict) -> bool:
+    """choices[*].delta 内任一内容字段非空即视为有内容。
+
+    tool_call 是合法内容——纯工具调用流（只有 tool_calls 没有
+    正文）必须放行，绝不能判成空流换号。
+    """
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for field in _GATE_CONTENT_FIELDS:
+            if delta.get(field):
+                return True
+    return False
+
+
+def _gate_saw_finish(obj: dict) -> bool:
+    """choices[*].finish_reason 非空 = 上游已给终止信号（[DONE] 前兆）。"""
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return False
+    return any(isinstance(c, dict) and c.get("finish_reason")
+               for c in choices)
+
+
+def _gate_classify(line: str) -> str:
+    """判定单条 data: 行的门内信号（调用方保证以 "data:" 开头）。
+
+    返回 "content"（有内容，判健康）/ "error"（流内 error 帧，判负）/
+    "terminator"（[DONE] 或 finish_reason，终止信号）/ "none"（无信号，
+    如纯 usage 帧）。JSON 解析失败按无信号处理（与 _stream_body 的
+    errors="ignore" 同风格：坏行不炸，只是不参与判定）。
+    """
+    payload = line[5:].strip()
+    if payload == "[DONE]":
+        return "terminator"
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return "none"
+    if not isinstance(obj, dict):
+        return "none"
+    err = obj.get("error")
+    if isinstance(err, dict) and err:
+        return "error"
+    if _gate_has_content(obj):
+        return "content"
+    if _gate_saw_finish(obj):
+        return "terminator"
+    return "none"
+
+
+def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
+    """同步 peek 上游 200 流的前若干字节/事件，判"流内是否已坏"。
+
+    为什么需要（方案 v2 §3.1）：上游可能 200 之后才在流内报错
+    （data:{"error":...}）、或直接空流（[DONE] 无内容、usage 后直接
+    DONE）——旧逻辑把垃圾透传给客户端，空流更让客户端拿到"成功空
+    回复"。peek 在换号循环内、return Response 之前同步执行：此时
+    状态码未定，判负还能换号。
+
+    判负红线：只耗 attempt 预算，绝不 _penalize_account。peek 只看
+    得到流的最开头，慢而健康的账号（首块内容 20s 后才到）可能被
+    误判，拖进冷却会造成级联耗竭——换号由 MAX_ACCOUNT_ATTEMPTS
+    兜底，冷却可没有自愈那么便宜。
+
+    返回 (verdict, prefetched, reason)：
+    - ("ok", prefetched, "")：判健康。prefetched 是已读字节块列表，
+      交还 _stream_body 先消化再续读；opened 不关（由 _stream_body
+      的 finally 收尾）。
+    - ("bad", [], reason)：判负。opened 在本函数内关闭（resp+client
+      都关，复用 opened.close()）——判负路径不经过 _stream_body，
+      连接归属在这里一次结清，调用方不得再 close。
+    """
+    prefetched: list[bytes] = []
+    line_buf = ""
+    saw_terminator = False
+    total_bytes = 0
+    events = 0
+    # 无内容计时从首个字节到达才开始：上游完全静默时 iter_bytes 阻塞，
+    # 由既有 120s read 超时兜底（见 GATE_NO_EVENT_TIMEOUT 注释）。
+    no_content_deadline = None
+    stream_iter = None
+
+    def _finish_bad(reason: str):
+        # 释放对已关流生成器的悬挂引用（判负路径 opened 已关，
+        # peek_iter 再指向它只是拖延垃圾回收）
+        opened.peek_iter = None
+        opened.close()
+        log.warning("流内嗅探判负（%s，账号 %s）: %s", model, uid, reason)
+        return ("bad", [], reason)
+
+    try:
+        # httpx 的 Response.iter_bytes() 只能完整迭代一次
+        # （is_stream_consumed 在首次迭代时置位，第二次调用抛
+        # StreamConsumed）。peek 判健康后剩余流还要交给
+        # _stream_body 续读，故把生成器挂回 opened
+        # （opened.peek_iter）——这是"无丢字节"续读的唯一正确路径。
+        # 放在 try 内：iter_bytes() 自身若抛异常（理论逃逸），
+        # 由下方 except 收尾，sess 不会被持有（_proxy_chat
+        # 判负分支会 release）。
+        stream_iter = opened.resp.iter_bytes()
+        opened.peek_iter = stream_iter
+        for chunk in stream_iter:
+            prefetched.append(chunk)
+            total_bytes += len(chunk)
+            line_buf += chunk.decode("utf-8", errors="ignore")
+            while "\n" in line_buf:
+                line, line_buf = line_buf.split("\n", 1)
+                if not line.startswith("data:"):
+                    continue
+                events += 1
+                signal = _gate_classify(line)
+                if signal == "content":
+                    return ("ok", prefetched, "")
+                if signal == "error":
+                    # 流内 error 帧：200 是假的，判负换号
+                    return _finish_bad("inband_error")
+                if signal == "terminator":
+                    saw_terminator = True
+                if saw_terminator:
+                    # 终止符已到却始终没见内容：空流，判负换号
+                    return _finish_bad("empty_stream")
+                if events >= GATE_MAX_EVENTS or total_bytes >= GATE_MAX_BYTES:
+                    # peek 预算（字节或事件）耗尽仍无内容：判负换号
+                    return _finish_bad("budget_exhausted")
+            # 超时判定移到本 chunk 内容解析之后（双审共识 P2-1）：
+            # 恰在 deadline 后到达的首内容帧不会被"先判超时后见
+            # 内容"误判。deadline 语义固定（首 chunk 时刻 +
+            # GATE_NO_EVENT_TIMEOUT，不滚动——keepalive 僵尸流
+            # 需要这唯一刹车）。
+            now = time.monotonic()
+            if no_content_deadline is None:
+                no_content_deadline = now + GATE_NO_EVENT_TIMEOUT
+            elif now > no_content_deadline:
+                # 有字节流动但超 20s 无内容事件：判负（只耗 attempt）
+                return _finish_bad("no_content_timeout")
+        # 流直接 EOF：无内容也无终止符。与 _stream_body 同风格，
+        # 末尾残余行（无换行结尾）也算一行再判——上游违规流可能
+        # 把内容塞在这里，误判成空流会冤枉健康账号
+        if line_buf and line_buf.startswith("data:"):
+            events += 1
+            signal = _gate_classify(line_buf)
+            if signal == "content":
+                return ("ok", prefetched, "")
+            if signal == "error":
+                return _finish_bad("inband_error")
+            if signal == "terminator":
+                saw_terminator = True
+        return _finish_bad("empty_stream")
+    except Exception as e:
+        # peek 期间读流异常（读超时/连接断）：视同无内容超时判负
+        # 换号——不让单账号的流内死亡把整个请求拖成 500
+        log.warning("流内嗅探读流异常（%s，账号 %s）: %s", model, uid, e)
+        opened.peek_iter = None
+        opened.close()
+        return ("bad", [], "no_content_timeout")
+
+
 def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                  sess=None, key_label: str | None = None,
-                 load_key: str | None = None):
+                 load_key: str | None = None, prefetched=None):
     """把已确认 200 的上游流吐给客户端，边吐边提取 usage 与上游实际模型名。
 
     首字节已出 → HTTP 状态码改不了，中途失败只能用 in-band SSE 错误事件收尾。
     uid 是记账/画像/面板用的身份（主池=账号，外部通道=provider 或 key 标签）；
     load_key 是并发负载登记用的键（外部通道带前缀，与 pick_key 的查询键一致）。
+    prefetched 非 None = 嗅探门已预读的字节块列表：先逐个消化（客户端
+    一个字节不丢），再续读同一上游流；为 None 时行为与无门时逐字节一致。
     """
     usage_captured = None
     line_buf = ""
@@ -363,22 +563,47 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     ttft_ms = None
     saw_done = False
     rid = registry.register(model, load_key or uid, stream=True)
+
+    def _consume_chunk(chunk: bytes) -> None:
+        """单 chunk 处理：记账 + 行缓冲解析 + usage/模型名提取。
+
+        提炼为局部函数：prefetched 预读字节与后续实时字节必须走
+        同一条处理路径——两份拷贝迟早漂移（0929 换号重构的同源教训）。
+        """
+        nonlocal usage_captured, line_buf, model_returned, ttft_ms, saw_done
+        registry.touch(rid, len(chunk))
+        if ttft_ms is None:
+            # 注：prefetched 路径下首字节时间含 peek 同步耗时（阶段 D
+            # 会精化 ttft 语义；当前如实记录——peek 阻塞期间客户端也
+            # 在等首字节，测大不算小）
+            ttft_ms = int((time.perf_counter() - started) * 1000)
+        line_buf += chunk.decode("utf-8", errors="ignore")
+        while "\n" in line_buf:
+            line, line_buf = line_buf.split("\n", 1)
+            if line.strip() == "data: [DONE]":
+                saw_done = True
+            u = _extract_usage_from_line(line)
+            if u:
+                usage_captured = u
+            m = _extract_model_from_line(line)
+            if m and not model_returned:
+                model_returned = m
+
     try:
-        for chunk in opened.resp.iter_bytes():
-            registry.touch(rid, len(chunk))
-            if ttft_ms is None:
-                ttft_ms = int((time.perf_counter() - started) * 1000)
-            line_buf += chunk.decode("utf-8", errors="ignore")
-            while "\n" in line_buf:
-                line, line_buf = line_buf.split("\n", 1)
-                if line.strip() == "data: [DONE]":
-                    saw_done = True
-                u = _extract_usage_from_line(line)
-                if u:
-                    usage_captured = u
-                m = _extract_model_from_line(line)
-                if m and not model_returned:
-                    model_returned = m
+        if prefetched is not None:
+            # 嗅探门预读的字节先原样吐出
+            for chunk in prefetched:
+                _consume_chunk(chunk)
+                yield chunk
+        # 续读剩余流：嗅探门判健康时 opened.peek_iter 是 peek 读到
+        # 一半的 iter_bytes 生成器（httpx 流只能完整迭代一次，续读
+        # 必须复用同一生成器，见 _peek_stream）；无门/外部通道时与
+        # 现状一致，直接 iter_bytes()。
+        stream_iter = getattr(opened, "peek_iter", None)
+        if stream_iter is None:
+            stream_iter = opened.resp.iter_bytes()
+        for chunk in stream_iter:
+            _consume_chunk(chunk)
             yield chunk
         if line_buf:
             u = _extract_usage_from_line(line_buf)
@@ -750,7 +975,31 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
         if is_stream:
             opened = _stream_open(data, model, headers)
             if opened.ok:
-                return Response(_stream_body(opened, model, uid, started, sess, key_label),
+                if _feature_stream_gate():
+                    # 流内嗅探门（T2 / 方案 v2 §3.1）：200 之后流内
+                    # 报错（error 帧/空流）时还能换号——此时状态码未定。
+                    verdict, prefetched, reason = _peek_stream(
+                        opened, model=model, uid=uid)
+                    if verdict == "bad":
+                        # 判负只耗 attempt 预算，绝不 _penalize_account
+                        # （审计红线：peek 只看流开头，慢而健康的账号
+                        # 可能被误判，拖进冷却会造成级联耗竭）。
+                        # opened 已在 _peek_stream 判负分支内关闭，
+                        # 此处不再重复 close，避免双重 close。
+                        session_pool.release(sess)
+                        last_open = _UpstreamOpen(error=f"gate: {reason}",
+                                                  snippet=reason)
+                        last_uid = uid
+                        activity.add("warn",
+                                     f"{model} · 账号 {uid} 流内嗅探判负({reason})，换号",
+                                     model=model, user_id=uid, status="gate")
+                        continue
+                    return Response(
+                        _stream_body(opened, model, uid, started, sess,
+                                     key_label, prefetched=prefetched),
+                        content_type="text/event-stream")
+                return Response(_stream_body(opened, model, uid, started,
+                                             sess, key_label),
                                 content_type="text/event-stream")
             session_pool.release(sess)
             last_open, last_uid = opened, uid
@@ -808,6 +1057,21 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                                     content_type=r.headers.get("content-type", "application/json"))
 
                 resp_json = r.json()
+                # 流内嗅探门的非流式对应物（T2）：上游 200 但响应体
+                # 本身是 error 对象（网关层包装的失败）——此时尚未
+                # 记账、未向客户端输出，换号仍来得及。与流式门同一
+                # 红线：只耗 attempt，绝不 _penalize_account。
+                if isinstance(resp_json.get("error"), dict) and resp_json["error"]:
+                    last_open = _UpstreamOpen(
+                        error="nonstream_inband_error",
+                        snippet=json.dumps(resp_json["error"],
+                                           ensure_ascii=False)[:800])
+                    last_uid = uid
+                    session_pool.release(sess)
+                    activity.add("warn",
+                                 f"{model} · 账号 {uid} 非流式响应流内错误，换号",
+                                 model=model, user_id=uid, status="gate")
+                    continue
                 usage = resp_json.get("usage")
                 if usage:
                     token_stats.record(uid, model, usage)
