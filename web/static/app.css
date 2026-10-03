@@ -507,3 +507,22 @@ textarea.input { resize: vertical; }
 ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.03); }
 ::-webkit-scrollbar-thumb { background: rgba(0, 229, 255, 0.25); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(0, 229, 255, 0.45); }
+
+/* ─── 运维面板补充（T8：排队车道 / 会话粘性 / 账号质量 / 语料采集）── */
+
+/* 实时动态 feed 新事件类型着色：gate=青 / affinity=品红 */
+.feed-item.gate { border-left-color: var(--cyan); }
+.feed-item.affinity { border-left-color: var(--magenta); }
+
+/* 表格/列表行悬浮微反馈（与 btn hover 同色系、低透明度） */
+.row:hover { background: rgba(0, 229, 255, 0.06); }
+
+/* 账号质量表 */
+.qwrap { max-height: 250px; overflow-y: auto; }
+.qtable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.qtable th { font-size: 9px; letter-spacing: 1px; font-weight: 400; color: var(--text-dim); text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.qtable td { padding: 5px 6px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; border-bottom: 1px solid rgba(0, 229, 255, 0.08); }
+.qtable th:first-child, .qtable td:first-child { text-align: left; }
+
+/* polish：头部计数徽标不换行 */
+.tag { white-space: nowrap; }

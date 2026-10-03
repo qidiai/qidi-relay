@@ -166,6 +166,7 @@ async function loadHealth() {
     $("status-text").textContent = "ONLINE";
     $("endpoint-url").textContent = d.endpoint;
     $("ver").textContent = (d.version || "4").split(".")[0];
+    $("bver").textContent = d.version || "?";
     animateNum($("kpi-uptime"), d.uptime_seconds, fmtUptime);
     kpiPrev["kpi-uptime"] = d.uptime_seconds; // 不滚动的特殊处理
     $("kpi-accounts").textContent = `${d.accounts_enabled}/${d.accounts}`;
@@ -869,12 +870,32 @@ function renderKeyCard(k) {
   const models = Object.entries(k.today_models || {})
     .sort((a, b) => b[1] - a[1]).slice(0, 4)
     .map(([m, t]) => `<span class="badge ext">${esc(m)} ${fmt(t)}</span>`).join("");
+  // 客户端预算（/api/keys/info 的 budget 块：仅配置 limit 的 key 才曝光）。
+  // tokens / cost 双 usage bar：超 80% 琥珀、触顶红；无限额 key 不显示条。
+  let budgetHtml = "";
+  const b = k.budget;
+  if (b) {
+    const tLimit = b.limit_tokens, tUsed = Number(b.used_tokens || 0);
+    const cLimit = b.limit_cost, cUsed = Number(b.used_cost || 0);
+    const barCls = (l, u) => (u / l >= 1 ? "crit" : (u / l > 0.8 ? "warn" : "ok"));
+    const tPct = tLimit ? Math.min(100, tUsed / tLimit * 100) : 0;
+    const cPct = cLimit ? Math.min(100, cUsed / cLimit * 100) : 0;
+    if (tLimit != null) {
+      budgetHtml += `<div class="acc-meta"><span>预算 tokens <b>${fmt(tUsed)} / ${fmt(tLimit)}</b></span><span>在途 <b>${b.inflight || 0}</b></span></div>`
+        + `<div class="exp-bar"><i class="${barCls(tLimit, tUsed)}" style="width:${tPct}%"></i></div>`;
+    }
+    if (cLimit != null) {
+      budgetHtml += `<div class="acc-meta"><span>预算 cost <b>$${fmtSpend(cUsed)} / $${fmtSpend(cLimit)}</b></span><span>重置 ${esc((b.reset_at || "—").slice(5, 16))}</span></div>`
+        + `<div class="exp-bar"><i class="${barCls(cLimit, cUsed)}" style="width:${cPct}%"></i></div>`;
+    }
+  }
   return `<div class="acc-card">
     <div class="acc-top"><span class="acc-name">${esc(k.label)}</span>${quotaBadge}</div>
     <div class="acc-id">${esc(k.key_preview || "")}</div>
     <div class="acc-meta"><span>今日 ${fmt(used)} tokens</span><b>${k.today_requests || 0} 次</b></div>
     ${models ? `<div class="acc-meta">${models}</div>` : ""}
     ${limit ? `<div class="hint">限额 ${fmt(limit)}/天 · 剩余 ${fmt(Math.max(0, limit - used))}</div>` : ""}
+    ${budgetHtml}
   </div>`;
 }
 
@@ -890,6 +911,149 @@ async function loadKeysInfo() {
     if (!sec) return;
     $("keys-tag").textContent = `${keys.length} KEYS`;
     $("keys-grid").innerHTML = keys.map(renderKeyCard).join("");
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+// ─── 运维面板：排队车道 / 会话粘性 / 账号质量 / 语料采集 ──────────────
+
+// 排队车道（GET /api/gate，3s 轮询；老后端无此接口时静默降级）
+let gateSupported = true;
+
+function renderGate(d) {
+  const fc = d.free_channel || {};
+  const busy = !!fc.busy;
+  const waiting = Number(fc.waiting || 0);
+  $("gate-led").className = busy ? "led" : "led on"; // 空闲绿 / 占用琥珀
+  $("gate-state-text").textContent = busy ? "占用" : "空闲";
+  $("gate-waiting").textContent = waiting;
+  $("gate-count-tag").textContent = busy ? (waiting > 0 ? `BUSY +${waiting}` : "BUSY") : "IDLE";
+}
+
+async function loadGate() {
+  if (!isAdmin || !gateSupported) return;
+  try {
+    const r = await api("/api/gate");
+    if (r.status === 404) { gateSupported = false; return; }
+    renderGate(await r.json());
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+// 会话粘性（GET /api/affinity/stats，15s 轮询）
+let affinitySupported = true;
+
+// why 码中文标签（proxy_core/affinity.py WHY_* 全集，语义以
+// pick_prefer / _account_state 产出路径为准）
+const AFFINITY_WHY = {
+  "kept": "保持粘连（账号正常）",
+  "turn": "工具循环内（同 turn 续请求）",
+  "session": "会话级粘性（策略档）",
+  "cache": "prompt cache 命中（跨 turn 粘）",
+  "new-turn": "新 turn（策略档）",
+  "no-cache": "缓存证据不足（<1024 tok）",
+  "no-data": "上游无 cache 字段",
+  "cold": "冷启动（无记忆/已过期）",
+  "resting": "账号冷却中",
+  "spent": "配额耗尽（402）",
+  "disabled": "账号已禁用",
+  "off": "粘性开关关闭",
+};
+
+function renderAffinity(d) {
+  const stuck = Number(d.stuck_sessions || 0);
+  const dist = d.why_distribution || {};
+  const has = stuck > 0 || Object.keys(dist).length > 0;
+  $("affinity-live").style.display = has ? "" : "none";
+  $("affinity-empty").style.display = has ? "none" : "";
+  $("affinity-count-tag").textContent = has ? `${stuck} STUCK` : "AFFINITY";
+  if (!has) return;
+  $("affinity-count").textContent = stuck;
+  $("affinity-why").innerHTML = Object.entries(dist)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `<div class="dist-row row"><span class="dist-name" title="${esc(k)}">${esc(AFFINITY_WHY[k] || k)}</span><span class="dist-val">${v}</span></div>`)
+    .join("");
+}
+
+async function loadAffinity() {
+  if (!isAdmin || !affinitySupported) return;
+  try {
+    const r = await api("/api/affinity/stats");
+    if (r.status === 404) { affinitySupported = false; return; }
+    renderAffinity(await r.json());
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+// 账号质量（GET /api/stats/quality，30s 轮询）
+let qualitySupported = true;
+
+function fmtMs(v) { return v == null ? "—" : Math.round(Number(v)) + "ms"; }
+
+function renderQuality(d) {
+  // samples 降序、前 50 截断（后端 quality_aggregate 同口径，前端兜底再固化一次）
+  const rows = (d.rows || [])
+    .slice()
+    .sort((a, b) => (Number(b.samples) || 0) - (Number(a.samples) || 0))
+    .slice(0, 50);
+  const wrap = $("quality-wrap"), empty = $("quality-empty");
+  $("quality-count-tag").textContent = rows.length ? `${rows.length} ROWS` : "QUALITY";
+  wrap.style.display = rows.length ? "" : "none";
+  empty.style.display = rows.length ? "none" : "";
+  if (!rows.length) return;
+  $("quality-rows").innerHTML = rows.map(r => `<tr class="row">
+      <td>${esc(r.user_id)}</td>
+      <td>${esc(r.model)}</td>
+      <td>${fmtMs(r.ttft_p50)}</td>
+      <td>${fmtMs(r.ttft_text_p50)}</td>
+      <td>${r.tokens_per_sec == null ? "—" : Number(r.tokens_per_sec).toFixed(1)}</td>
+      <td>${r.samples == null ? "—" : r.samples}</td>
+      <td>${r.water_hits == null ? "—" : r.water_hits}</td>
+    </tr>`).join("");
+}
+
+async function loadQuality() {
+  if (!isAdmin || !qualitySupported) return;
+  try {
+    const r = await api("/api/stats/quality");
+    if (r.status === 404) { qualitySupported = false; return; }
+    renderQuality(await r.json());
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+// 语料采集（GET /api/corpus/stats，30s 轮询）
+let corpusSupported = true;
+
+function fmtTop3(obj) {
+  const top = Object.entries(obj || {})
+    .filter(([, v]) => Number(v) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 3);
+  return top.map(([k, v]) => `${k} ${v}`).join(" · ") || "—";
+}
+
+function renderCorpus(d) {
+  const on = !!d.enabled;
+  $("corpus-off").style.display = on ? "none" : "";
+  $("corpus-on").style.display = on ? "" : "none";
+  $("corpus-count-tag").textContent = on ? "ON" : "OFF";
+  if (!on) return;
+  const t = d.today || {}, m = d.month || {};
+  $("corpus-today-count").textContent = t.count || 0;
+  $("corpus-today-tokens").textContent = fmt(t.tokens || 0);
+  $("corpus-month-count").textContent = m.count || 0;
+  $("corpus-month-tokens").textContent = fmt(m.tokens || 0);
+  $("corpus-models").textContent = fmtTop3(d.by_model);
+  $("corpus-roles").textContent = fmtTop3(d.by_role);
+  $("corpus-water").textContent = d.water_suspect || 0;
+  $("corpus-redact").textContent = d.redact_hits || 0;
+  $("corpus-discard").textContent = d.discarded || 0;
+  $("corpus-backlog").textContent = d.backlog || 0;
+}
+
+async function loadCorpus() {
+  if (!isAdmin || !corpusSupported) return;
+  try {
+    const r = await api("/api/corpus/stats");
+    if (r.status === 404) { corpusSupported = false; return; }
+    renderCorpus(await r.json());
   } catch (e) { /* 忽略瞬时错误 */ }
 }
 
@@ -1070,6 +1234,16 @@ function toggleActivityPause(btn) {
   btn.textContent = activityPaused ? "继续" : "暂停";
 }
 
+// feed 着色映射：status 类型 gate=青 / affinity=品红（proxy.py 的
+// activity.add 以 status 字段携带，kind 仅为 info/warn）；kind=ok
+// 绿；其余=红（错误）
+function feedCls(e) {
+  if (e.status === "gate") return "gate";
+  if (e.status === "affinity") return "affinity";
+  if (e.kind === "ok") return "ok";
+  return "error";
+}
+
 async function loadActivity() {
   if (!isAdmin || activityPaused) return;
   try {
@@ -1083,7 +1257,7 @@ async function loadActivity() {
     }
     activityMaxSeq = events[0].seq;
     feed.innerHTML = events.map(e => `
-      <div class="feed-item ${e.kind === "ok" ? "ok" : "error"}">
+      <div class="feed-item ${feedCls(e)}">
         <span class="feed-time">${esc(e.time)}</span>
         <span class="feed-msg" title="${esc(e.message)}">${esc(e.message)}</span>
         <span class="feed-meta"><b>${esc(e.latency_ms)}</b>ms · <b>${fmt(e.tokens)}</b>tok</span>
@@ -1392,6 +1566,10 @@ function loadAll() {
   loadLogs(true);
   loadAuthState();
   loadModels();
+  loadGate();
+  loadAffinity();
+  loadQuality();
+  loadCorpus();
 }
 
 loadHealth();
@@ -1400,10 +1578,11 @@ checkAuth();
 
 setInterval(loadHealth, 5000);
 setInterval(() => { if (isAdmin) { loadActivity(); } }, 4000);
-setInterval(() => { if (isAdmin) { loadAccounts(); loadTokenStats(); loadHistory(); } }, 15000);
+setInterval(() => { if (isAdmin) { loadAccounts(); loadTokenStats(); loadHistory(); loadAffinity(); } }, 15000);
 setInterval(() => { if (isAdmin) { loadLogs(); } }, 10000);
 setInterval(() => { if (isAdmin) { loadUpstream(); loadProvidersInfo(); loadKeysInfo(); } }, 60000);
-setInterval(() => { if (isAdmin) { loadKeysInfo(); } }, 30000);
+setInterval(() => { if (isAdmin) { loadKeysInfo(); loadQuality(); loadCorpus(); } }, 30000);
+setInterval(() => { if (isAdmin) { loadGate(); } }, 3000);
 setInterval(() => { if (isAdmin) { loadInflight(); } }, 3000);
 setInterval(() => { if (isAdmin) { loadWater(); } }, 15000);
 addEventListener("resize", () => { loadHistory(); renderDist(); });

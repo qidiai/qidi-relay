@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QiDi Relay · 局域网中转控制台</title>
-<link rel="stylesheet" href="/static/app.css?v=45">
+<link rel="stylesheet" href="/static/app.css?v=46">
 </head>
 <body>
 <canvas id="bg-canvas"></canvas>
@@ -124,6 +124,82 @@
     </div>
   </section>
 
+  <!-- 账号质量 -->
+  <section class="panel" id="panel-quality">
+    <div class="panel-head">
+      <h2>账号质量 <span class="tag" id="quality-count-tag">QUALITY</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="qwrap" id="quality-wrap" style="display:none">
+        <table class="qtable">
+          <thead>
+            <tr>
+              <th>账号</th>
+              <th>模型</th>
+              <th title="首内容 delta 到达（ms）">ttft_p50</th>
+              <th title="首可见文本 delta 到达（ms）">ttft_text_p50</th>
+              <th>t/s</th>
+              <th>样本数</th>
+              <th>注水命中</th>
+            </tr>
+          </thead>
+          <tbody id="quality-rows"></tbody>
+        </table>
+      </div>
+      <div class="acc-empty" id="quality-empty">样本积累中（约 12 次流式请求后出数）</div>
+      <p class="hint">口径：ttft_p50 = 首内容 / ttft_text_p50 = 首可见文本（剥离 thinking）；仅流式样本入列，samples 降序取前 50。</p>
+    </div>
+  </section>
+
+  <!-- 语料采集 -->
+  <section class="panel" id="panel-corpus">
+    <div class="panel-head">
+      <h2>语料采集 <span class="tag" id="corpus-count-tag">CORPUS</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="acc-empty" id="corpus-off">语料采集未启用（config corpus.enabled）</div>
+      <div id="corpus-on" style="display:none">
+        <div class="acc-meta"><span>今日 <b id="corpus-today-count">0</b> 条 · <b id="corpus-today-tokens">0</b> tok</span><span>本月 <b id="corpus-month-count">0</b> 条 · <b id="corpus-month-tokens">0</b> tok</span></div>
+        <div class="acc-meta"><span>模型 top3 <b id="corpus-models">—</b></span></div>
+        <div class="acc-meta"><span>角色 top3 <b id="corpus-roles">—</b></span></div>
+        <div class="acc-meta"><span>注水嫌疑 <b id="corpus-water">0</b></span><span>脱敏命中 <b id="corpus-redact">0</b></span></div>
+        <div class="acc-meta"><span>丢弃 <b id="corpus-discard">0</b></span><span>队列积压 <b id="corpus-backlog">0</b></span></div>
+      </div>
+      <p class="hint">语料落盘 worker 实时计数；按模型 / 角色各取 top3。</p>
+    </div>
+  </section>
+
+  <!-- 会话粘性 -->
+  <section class="panel" id="panel-affinity">
+    <div class="panel-head">
+      <h2>会话粘性 <span class="tag" id="affinity-count-tag">AFFINITY</span></h2>
+    </div>
+    <div class="panel-body">
+      <div id="affinity-live" style="display:none">
+        <div class="kpi-val cyan" id="affinity-count">0</div>
+        <div class="hint">粘住会话（跨 turn 复用同一账号）</div>
+        <div class="dist-list" id="affinity-why"></div>
+      </div>
+      <div class="acc-empty" id="affinity-empty">尚无粘性记忆</div>
+      <p class="hint">吃上游 prompt cache 省钱</p>
+    </div>
+  </section>
+
+  <!-- 排队车道 -->
+  <section class="panel" id="panel-gate">
+    <div class="panel-head">
+      <h2>排队车道 <span class="tag" id="gate-count-tag">IDLE</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="acc-top">
+        <span class="led on" id="gate-led"></span>
+        <span class="acc-name" id="gate-state-text">空闲</span>
+      </div>
+      <div class="acc-meta"><span>排队等待</span><b id="gate-waiting">0</b></div>
+      <p class="hint">免费通道串行门：同一时刻仅一路请求占用免费通道；等待不计账号失败/冷却。</p>
+    </div>
+  </section>
+
   <!-- 实时动态 -->
   <section class="panel" id="panel-activity">
     <div class="panel-head">
@@ -194,7 +270,7 @@
 
 </main>
 
-<footer class="foot">QiDi Relay v4 · 模块化重构版 · 数据文件兼容 v3</footer>
+<footer class="foot">QiDi Relay v4 · 模块化重构版 · 数据文件兼容 v3<br><span style="font-size:9px;letter-spacing:2px;opacity:.75">backend v<span id="bver">…</span></span></footer>
 
 <!-- ═══ 登录闸门 ═══ -->
 <div class="gate" id="login-gate" style="display:none">
@@ -236,6 +312,6 @@
 
 <div class="toast-zone" id="toast-zone"></div>
 
-<script src="/static/app.js?v=45"></script>
+<script src="/static/app.js?v=46"></script>
 </body>
 </html>
