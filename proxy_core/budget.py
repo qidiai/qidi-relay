@@ -137,12 +137,16 @@ def _used_for(label: str, budget: dict) -> tuple:
     缓存读 token 不计入（record_key 单独累计 cache_tokens，
     stats.py:72-96）。
 
-    cost 折算口径（下界）：把各模型当日 token 全部视作
-    输入 token、按 pricing 现价折算——输入价通常低于
-    输出价，故为实际成本下界；per-model 用量不含
-    cache 拆分，故 cost 不做 cache 剔除。按单一输入
-    口径折算会稀释真实成本，cost 限额作粗粒度兜底
-    （tokens 限额为主判据）。
+    cost 折算口径（T9 P1-2 拆输入输出）：新条目按
+    stats 拆记的 prompt/completion 折算（costing.
+    cost_of 四参全用——输出 token 按输出价，不再
+    按单一输入口径折算稀释真实成本，双审实测旧口径
+    低估 1.6–4.5×）；per-model 用量只有总量——按
+    模型 token 占当日总量比例分摊拆分。旧条目（无
+    拆分字段，get_key_stats 回落 p=total, c=0）
+    保持既有输入价口径。per-model 用量不含 cache
+    拆分，故 cost 不做 cache 剔除。cost 限额仍作
+    粗粒度兜底（tokens 限额为主判据）。
 
     类型防御（R5）：重放异常不得逃逸临界区——
     reserve 的乐观登记（n/tokens/cost）在锁内、
@@ -168,8 +172,25 @@ def _replay_used(label: str, budget: dict) -> tuple:
     for e in token_stats.get_key_stats():
         if e.get("label") != label:
             continue
+        # 拆输入输出口径（T9 P1-2）：cost_of 四参全用
+        # ——按 stats 拆记的 prompt/completion 折算。
+        # models 字典只有 per-model 总量——按模型 token
+        # 占当日总量比例分摊拆分。旧条目回落
+        # （get_key_stats 补 p=total, c=0）时分摊结果
+        # 恰为 p=t, c=0，与升级前逐字节一致。
+        e_total = int(e.get("total_tokens", 0) or 0)
+        e_prompt = int(e.get("prompt_tokens", 0) or 0)
+        e_completion = int(e.get("completion_tokens", 0) or 0)
         for model, t in (e.get("models") or {}).items():
-            u_cost += cost_of(pricing, model, int(t or 0), 0)
+            t = int(t or 0)
+            if e_total > 0:
+                share = t / e_total
+                u_cost += cost_of(
+                    pricing, model,
+                    int(e_prompt * share),
+                    int(e_completion * share))
+            else:
+                u_cost += cost_of(pricing, model, t, 0)
         u_tokens = int(e.get("total_tokens", 0) or 0)
         if not budget.get("cache_reads", False):
             u_tokens = max(0, u_tokens - int(e.get("cache_tokens", 0) or 0))

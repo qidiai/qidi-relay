@@ -16,7 +16,7 @@ log = logging.getLogger("qidi-relay")
 
 HISTORY_KEY = "__history__"
 HISTORY_KEEP_HOURS = 24 * 7  # 历史桶保留 7 天
-KEY_STATS_KEY = "__keys__"   # 按 API key 的用量（label -> {date, total_tokens, requests, models:{...}}）
+KEY_STATS_KEY = "__keys__"   # 按 API key 的用量（label -> {date, total_tokens, requests, models:{...}, prompt_tokens, completion_tokens, cache_tokens}）
 
 
 def _blank_entry():
@@ -95,7 +95,8 @@ class TokenStats:
 
     def _blank_key_entry(self, date: str) -> dict:
         return {"date": date, "total_tokens": 0, "requests": 0,
-                "models": {}, "cache_tokens": 0}
+                "models": {}, "cache_tokens": 0,
+                "prompt_tokens": 0, "completion_tokens": 0}
 
     def record_key(self, label: str, model: str, usage: dict):
         """按 API key 标签记录一次请求用量（跨天自动清零）。
@@ -103,6 +104,11 @@ class TokenStats:
         cache_tokens 单独累计（客户端预算 cache_reads=false
         时不计入预算；total_tokens 口径不变——旧限额检查与
         面板展示不受影响）。
+
+        拆输入输出口径（T9 P1-2）：prompt_tokens/
+        completion_tokens 从 usage 提取单独累计（缺失
+        回落 0）——供预算 used 成本按输入/输出价折算
+        （budget._replay_used）。
         """
         if not usage or not label:
             return
@@ -113,6 +119,9 @@ class TokenStats:
                 e = self._blank_key_entry(today)
                 self.key_stats[label] = e
             e["total_tokens"] += usage.get("total_tokens", 0)
+            e["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            e["completion_tokens"] += usage.get(
+                "completion_tokens", 0)
             e["requests"] += 1
             m = e["models"].get(model, 0)
             e["models"][model] = m + usage.get("total_tokens", 0)
@@ -140,6 +149,13 @@ class TokenStats:
                     "requests": e.get("requests", 0),
                     "models": dict(e.get("models", {})),
                     "cache_tokens": e.get("cache_tokens", 0),
+                    # 拆输入输出口径（T9 P1-2）：旧条目无
+                    # 拆分字段时回落 p=total, c=0（口径
+                    # 兼容——预算成本折算按此回落保持既有
+                    # 输入价口径，budget._replay_used）
+                    "prompt_tokens": e.get(
+                        "prompt_tokens", e.get("total_tokens", 0)),
+                    "completion_tokens": e.get("completion_tokens", 0),
                 })
             out.sort(key=lambda x: x["total_tokens"], reverse=True)
             return out

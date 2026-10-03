@@ -24,7 +24,8 @@ config.json "corpus" 块：
   enabled（缺省 False——语料涉及落盘用户数据，
     默认关闭更稳妥，用户显式开启；与
     stream_gate/affinity 的缺省 True 不同）、
-  sample_rate（0-1 采样率，缺省 1.0）、
+  sample_rate（0-1 采样率，缺省 1.0；月度文件
+    超 500MB 时生效值封顶 0.3——T9 P2-5 降采样）、
   roles（角色白名单，空/缺省 = 不限）、
   include_thinking（思考过程是否入语料，缺省
     True）、max_body_tokens（单样本 token 上限，
@@ -69,6 +70,15 @@ _ALERT_HINT_INTERVAL_S = 600.0
 _alert_hint_lock = threading.Lock()
 _last_alert_hint_ts = 0.0
 
+# 月度文件降采样（T9 P2-5）：当月落盘文件超过
+# 500MB 时，生效采样率封顶 0.3（防语料无限增长
+# 刷爆磁盘），activity/log 限频提示（同 seedguard
+# 告警态提示模式，防刷屏）。
+_MAX_MONTH_BYTES = 500 * 1024 * 1024
+_BIG_MONTH_SAMPLE_CAP = 0.3
+_downsample_hint_lock = threading.Lock()
+_last_downsample_hint_ts = 0.0
+
 
 # ─── config 读取（每请求现读——与 _feature_stream_gate
 # 同风格，改 config.json 不必重启即生效）────────────
@@ -96,6 +106,14 @@ def _corpus_cfg() -> dict:
     except (TypeError, ValueError):
         rate = DEFAULT_SAMPLE_RATE
     rate = min(1.0, max(0.0, rate))
+    # 生效采样率（T9 P2-5）：月度落盘文件超 500MB
+    # 时封顶 0.3（降采样防刷盘）——maybe_collect 的
+    # 采样决策用 sample_rate_effective 而非配置值。
+    sample_rate_effective = rate
+    if (rate > _BIG_MONTH_SAMPLE_CAP
+            and _month_file_size() > _MAX_MONTH_BYTES):
+        sample_rate_effective = _BIG_MONTH_SAMPLE_CAP
+        _downsample_hint_once()
     roles = raw.get("roles")
     if isinstance(roles, list):
         roles = [r for r in roles if isinstance(r, str) and r]
@@ -115,6 +133,7 @@ def _corpus_cfg() -> dict:
     return {
         "enabled": bool(raw.get("enabled", False)),
         "sample_rate": rate,
+        "sample_rate_effective": sample_rate_effective,
         "roles": roles,
         "include_thinking": incl,
         "max_body_tokens": max_body,
@@ -491,6 +510,35 @@ def _alert_hint_once() -> None:
                  status="corpus-pause")
 
 
+def _month_file_size() -> int:
+    """当月落盘文件实际大小（字节；目录/文件缺失或
+    任何 OSError 容错 0——T9 P2-5 降采样判据）。"""
+    try:
+        return os.path.getsize(
+            CORPUS_DIR / f"local_{datetime.now():%Y%m}.jsonl")
+    except OSError:
+        return 0
+
+
+def _downsample_hint_once() -> None:
+    """月度文件超限降采样提示（activity 面板黄条 +
+    log）——同一限频窗口（_ALERT_HINT_INTERVAL_S）
+    内至多一次（防刷屏，同 seedguard 告警态提示
+    模式）。"""
+    global _last_downsample_hint_ts
+    now = time.time()
+    with _downsample_hint_lock:
+        if now - _last_downsample_hint_ts < _ALERT_HINT_INTERVAL_S:
+            return
+        _last_downsample_hint_ts = now
+    activity.add("warn", "语料月度文件已超 500MB，"
+                 "采样率临时封顶 0.3（降采样防刷盘）",
+                 status="corpus-downsample")
+    log.warning("[语料] 月度文件超 %.0fMB，采样率封顶 %.1f",
+                _MAX_MONTH_BYTES / 1024 / 1024,
+                _BIG_MONTH_SAMPLE_CAP)
+
+
 def maybe_collect(correlation, assistant, *, uid: str,
                   model: str, model_served=None,
                   usage=None, ttft_content_ms=None,
@@ -525,7 +573,8 @@ def maybe_collect(correlation, assistant, *, uid: str,
     if _seedguard_alert():
         _alert_hint_once()
         return None
-    if cfg["sample_rate"] < 1.0 and random.random() > cfg["sample_rate"]:
+    if (cfg["sample_rate_effective"] < 1.0
+            and random.random() > cfg["sample_rate_effective"]):
         return None
     role = _role_of(model)
     if cfg["roles"] is not None and role not in cfg["roles"]:
@@ -886,10 +935,13 @@ class QueueWorker:
         """/api/corpus/stats 面板数据（§7.6）：今日/
         本月条数与 token 量、按 model/role 分布、
         water_suspect 数、redact_hits 总数、丢弃
-        计数、队列积压。"""
+        计数、队列积压、月度文件大小与生效采样率
+        （T9 P2-5 降采样面板曝光）。"""
+        cfg = _corpus_cfg()
+        month_size = _month_file_size()
         with self._lock:
             return {
-                "enabled": corpus_enabled(),
+                "enabled": cfg["enabled"],
                 "today": {"date": self._day,
                           "count": self._day_count,
                           "tokens": self._day_tokens},
@@ -905,6 +957,8 @@ class QueueWorker:
                 "discarded": self._discarded,
                 "oversize": self._oversize,
                 "backlog": self._q.qsize(),
+                "month_size_bytes": month_size,
+                "sample_rate_effective": cfg["sample_rate_effective"],
             }
 
 

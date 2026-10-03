@@ -75,7 +75,14 @@ def _collect_dup_keys(node, prefix: str, out: list) -> None:
             continue
         f = k.casefold()
         if f in folded:
-            path = f"{prefix}{folded[f]} 与 {prefix}{k} 大小写折叠后重复"
+            if folded[f] == k:
+                # 两处拼写完全相同：旧文案 "X 与 X" 冗余
+                # （T9 P3-8b）——明示重复出现即可
+                path = (f"{prefix}{k} 重复出现"
+                        "（两处拼写完全相同）")
+            else:
+                path = (f"{prefix}{folded[f]} 与 {prefix}{k}"
+                        " 大小写折叠后重复")
             if path not in out:
                 out.append(path)
             if len(out) >= _MAX_DUP_KEY_WARNINGS:
@@ -97,19 +104,28 @@ def load_config() -> dict:
     """加载管理员配置，文件缺失或损坏时返回安全默认值。
 
     大小写折叠后重复的键路径收集进 CONFIG_DUPLICATE_KEY_WARNINGS
-    （每次加载前清空；上限 20 条、去重）——解析结果本身不变
+    （每次加载先收集局部表、成功后整体替换——并发读者
+    不见半表；上限 20 条、去重）——解析结果本身不变
     （重复键仍按 json 语义后者覆盖前者）。
     """
-    CONFIG_DUPLICATE_KEY_WARNINGS.clear()
     if not CONFIG_FILE.exists():
+        CONFIG_DUPLICATE_KEY_WARNINGS[:] = []
         return {"admin_password": None, "allowed_ips": ["*"]}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f, object_pairs_hook=_DupKeyNode)
     except Exception:
+        CONFIG_DUPLICATE_KEY_WARNINGS[:] = []
         return {"admin_password": None, "allowed_ips": ["*"]}
+    # 先收集局部表、成功后整体替换（T9 P3-8a）：消除
+    # 并发 clear/append 交错——读者要么见旧表要么见
+    # 新表，不见半表。原地切片赋值而非重绑名字：
+    # from 导入方（routes/proxy.py:43）持有原表对象
+    # 引用，重绑会使其读到陈旧表。
+    warnings: list = []
     if isinstance(cfg, _DupKeyNode):
-        _collect_dup_keys(cfg, "", CONFIG_DUPLICATE_KEY_WARNINGS)
+        _collect_dup_keys(cfg, "", warnings)
+    CONFIG_DUPLICATE_KEY_WARNINGS[:] = warnings
     return cfg
 
 
@@ -203,6 +219,46 @@ def _parse_budget(item: dict, daily_limit: int | None) -> dict | None:
             "cache_reads": bool(raw.get("cache_reads", False))}
 
 
+# key label 撞名去重（T9 P1-1）：两个条目 label 相同
+# （含缺省 label = key 前 12 位截断撞名）时，解析期
+# 去重命名——首个保持原名，后续同名条目加 #2/#3 后缀
+# （确定性：按配置出现顺序、后缀递增避开已用 label），
+# 保证同一 label 唯一映射一个 key。每个 (原名, 新名)
+# 对只告警一次（get_api_keys 每请求高频调用，防刷屏）。
+_LABEL_DEDUPE_WARNED: set = set()
+
+
+def _dedupe_key_labels(out: dict) -> dict:
+    """label 撞名去重（首个保持原名，后续同名条目
+    加 #2/#3 后缀）。返回新表（键顺序不变）。"""
+    if not out:
+        return out
+    used: set = set()
+    deduped: dict = {}
+    for k, v in out.items():
+        label = v["label"]
+        final = label
+        if final in used:
+            i = 2
+            while f"{label}#{i}" in used:
+                i += 1
+            final = f"{label}#{i}"
+            if (label, final) not in _LABEL_DEDUPE_WARNED:
+                _LABEL_DEDUPE_WARNED.add((label, final))
+                log.warning(
+                    "api_keys 两个条目 label 撞名（%s）："
+                    "首个保持原名，后续条目重命名为 %s",
+                    label, final)
+        used.add(final)
+        if final == label:
+            deduped[k] = v
+        else:
+            v2 = dict(v)
+            v2["label"] = final
+            deduped[k] = v2
+    return deduped
+
+
 def _parse_api_keys(raw) -> dict:
     """归一化 api_keys 配置 -> {key: {label, limit, budget}}。
 
@@ -251,7 +307,7 @@ def _parse_api_keys(raw) -> dict:
                          if budget is not None and budget.get("tokens") is not None
                          else limit)
             out[k] = {"label": label, "limit": effective, "budget": budget}
-    return out
+    return _dedupe_key_labels(out)
 
 
 def get_api_keys() -> dict:

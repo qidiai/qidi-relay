@@ -9,6 +9,7 @@ import json
 import hmac as hmac_mod
 import logging
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -522,6 +523,32 @@ def _feature_budget() -> bool:
             if isinstance(feats, dict) else True)
 
 
+# debug_last_request 互斥警示（T9 P2-6）：该调试开关
+# 把 /v1/chat/completions 的完整请求体原文写入
+# last_request.json——未脱敏，与语料 redact 管线互斥，
+# 仅限本地排查。开启且有请求经过时 log.warning 限频
+# 提示（同 seedguard 告警态提示模式，防刷屏）。
+_DEBUG_LAST_REQ_HINT_INTERVAL_S = 600.0
+_debug_last_req_hint_lock = threading.Lock()
+_last_debug_last_req_hint_ts = 0.0
+
+
+def _debug_last_request_warn_once() -> None:
+    """debug_last_request 互斥警示——限频窗口
+    （_DEBUG_LAST_REQ_HINT_INTERVAL_S）内至多一次
+    （单测：重置 _last_debug_last_req_hint_ts 后
+    连调两次，断言只产生一条 warning）。"""
+    global _last_debug_last_req_hint_ts
+    now = time.time()
+    with _debug_last_req_hint_lock:
+        if (now - _last_debug_last_req_hint_ts
+                < _DEBUG_LAST_REQ_HINT_INTERVAL_S):
+            return
+        _last_debug_last_req_hint_ts = now
+    log.warning("debug_last_request 落全文未脱敏请求，"
+                "与语料 redact 管线互斥，仅限本地排查")
+
+
 # 嗅探门内容判定的字段集（OpenAI 形流式帧，防御式逐字段取）
 _GATE_CONTENT_FIELDS = ("content", "refusal", "reasoning_content",
                         "reasoning", "tool_calls", "function_call")
@@ -761,31 +788,42 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
             line, line_buf = line_buf.split("\n", 1)
             if line.strip() == "data: [DONE]":
                 saw_done = True
-            u = _extract_usage_from_line(line)
-            if u:
-                usage_captured = u
-            m = _extract_model_from_line(line)
-            if m and not model_returned:
-                model_returned = m
-            # 显式偏差声明（双审裁决 2026-10-03）：TTFT 被动观测
-            # 不受 features.stream_gate 连坐（关门不损失质量数据），
-            # 旧首字节口径并存，回滚安全。
-            if (tap is not None
-                    or ttft_content_ms is None
-                    or ttft_text_ms is None):
-                # 双口径 TTFT 采集（阶段 D / 方案 §6）：解
-                # data: 帧逐字段判定（字段集与嗅探门
-                # _GATE_CONTENT_FIELDS 同源——共享常量，
-                # 避免两处漂移；行解析口径与门一致，整行
-                # 到达才计）。两口径都集齐后停止解析
-                # （纯开销门——语料 tap 开启时除外：tap
-                # 需逐帧累积）。
-                if line.startswith("data:"):
+            # data: 行三消费者（usage/模型名/TTFT）共享一次
+            # JSON 解析（T9 P2-3：同行旧实现最多解析 3 次——
+            # _extract_usage_from_line/_extract_model_from_
+            # line/TTFT 各一次）。廉价子串预检顺序与容错保留：
+            # usage/模型名仅对 "data: "（带空格）形态行生效
+            # （与两个 _extract_* 的预检逐字一致），TTFT 对
+            # "data:" 即可；任一消费者需要才解析，解析失败
+            # obj=None 回落现有行为（三消费者全跳过）。
+            if line.startswith("data:"):
+                _sp = line.startswith("data: ")
+                _need_ttft = (tap is not None
+                              or ttft_content_ms is None
+                              or ttft_text_ms is None)
+                if (_need_ttft
+                        or (_sp and "usage" in line)
+                        or (_sp and '"model"' in line)):
                     try:
                         obj = json.loads(line[5:].strip())
                     except (ValueError, TypeError):
                         obj = None
                     if isinstance(obj, dict):
+                        if _sp:
+                            # usage/模型名提取（原 _extract_*
+                            # 逻辑内联——解析已共享，不再
+                            # 重复解析）
+                            u = obj.get("usage")
+                            if u:
+                                usage_captured = u
+                            if not model_returned:
+                                m = obj.get("model")
+                                if isinstance(m, str) and m:
+                                    model_returned = m
+                        # 显式偏差声明（双审裁决 2026-10-03）：
+                        # TTFT 被动观测不受 features.stream_gate
+                        # 连坐（关门不损失质量数据），旧首字节
+                        # 口径并存，回滚安全。
                         if tap is not None:
                             # 语料采集（阶段 E / 方案 §7.1）：
                             # 累积 assistant content/thinking/
@@ -793,6 +831,13 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                             tap.feed(obj)
                         if (ttft_content_ms is None
                                 or ttft_text_ms is None):
+                            # 双口径 TTFT 采集（阶段 D / 方案
+                            # §6）：解 data: 帧逐字段判定（字段集
+                            # 与嗅探门 _GATE_CONTENT_FIELDS 同源
+                            # ——共享常量，避免两处漂移；行解析
+                            # 口径与门一致，整行到达才计）。两口径
+                            # 都集齐后停止解析（纯开销门——语料
+                            # tap 开启时除外：tap 需逐帧累积）。
                             for choice in obj.get("choices") or ():
                                 if not isinstance(choice, dict):
                                     continue
@@ -1290,9 +1335,19 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                 if _feature_stream_gate():
                     # 流内嗅探门（T2 / 方案 v2 §3.1）：200 之后流内
                     # 报错（error 帧/空流）时还能换号——此时状态码未定。
+                    # peek 期负载登记（T9 P3-7）：peek 同步阻塞至多
+                    # GATE_NO_EVENT_TIMEOUT 秒，期间该账号在 registry
+                    # 无登记 → 并发选号（loads=registry.load_of）
+                    # 低估其负载。与 _stream_body 的 register/finish
+                    # 原样并存、不双重计数：peek rid 判健康时立即
+                    # finish("peek") 再 return——_stream_body 的 rid
+                    # 覆盖其后的吐流阶段，两阶段时间不重叠。
+                    peek_rid = registry.register(
+                        model, uid, stream=True)
                     verdict, prefetched, reason = _peek_stream(
                         opened, model=model, uid=uid)
                     if verdict == "bad":
+                        registry.finish(peek_rid, "gate")
                         # 判负只耗 attempt 预算，绝不 _penalize_account
                         # （审计红线：peek 只看流开头，慢而健康的账号
                         # 可能被误判，拖进冷却会造成级联耗竭）。
@@ -1306,6 +1361,10 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                                      f"{model} · 账号 {uid} 流内嗅探判负({reason})，换号",
                                      model=model, user_id=uid, status="gate")
                         continue
+                    # 判健康：peek rid 立即终结（"peek"）——吐流
+                    # 阶段由 _stream_body 自己的 rid 登记（见上方
+                    # peek 登记注释），避免双重计数
+                    registry.finish(peek_rid, "peek")
                     return Response(
                         _stream_body(opened, model, uid, started, sess,
                                      key_label, prefetched=prefetched,
@@ -1838,9 +1897,21 @@ def _forward_cline(data: dict, model: str, prov: dict):
                         gate_opened = _UpstreamOpen(
                             status=200,
                             resp=cline.ClineStreamWrap(r, model))
+                        # peek 期负载登记（T9 P3-7）：同主池——
+                        # 登记键与 _stream_body 的 load_key 一致
+                        # （f"cl:{pname}|{label}"，cline.py:428
+                        # load_of 查询键），peek 阻塞期间通道负载
+                        # 不被低估；判健康立即 finish("peek")，
+                        # 吐流阶段归 _stream_body 的 rid，不
+                        # 双重计数。
+                        peek_rid = registry.register(
+                            model,
+                            f"cl:{pname}|{ch.label if len(channels) > 1 else pname}",
+                            stream=True)
                         verdict, gate_prefetched, reason = _peek_stream(
                             gate_opened, model=model, uid=ch.label)
                         if verdict == "bad":
+                            registry.finish(peek_rid, "gate")
                             r = None
                             activity.add(
                                 "warn",
@@ -1855,8 +1926,12 @@ def _forward_cline(data: dict, model: str, prov: dict):
                             gate_opened = None
                             gate_prefetched = None
                             continue
-                        # 判健康：client 生命周期归 _stream_body
-                        # 的 finally 收尾（与无门时一致）
+                        # 判健康：peek rid 立即终结（"peek"）——
+                        # 吐流阶段归 _stream_body 的 rid（见上方
+                        # 注释，不双重计数）；client 生命周期归
+                        # _stream_body 的 finally 收尾（与无门时
+                        # 一致）
+                        registry.finish(peek_rid, "peek")
                         gate_opened.client = client
                         break
                     break
@@ -2170,9 +2245,21 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                         gate_opened = _UpstreamOpen(
                             status=200,
                             resp=minicode.MiniCodeStreamWrap(r, model))
+                        # peek 期负载登记（T9 P3-7）：同主池——
+                        # 登记键与 _stream_body 的 load_key 一致
+                        # （f"mc:{pname}|{label}"，minicode.py:445
+                        # load_of 查询键），peek 阻塞期间通道负载
+                        # 不被低估；判健康立即 finish("peek")，
+                        # 吐流阶段归 _stream_body 的 rid，不
+                        # 双重计数。
+                        peek_rid = registry.register(
+                            model,
+                            f"mc:{pname}|{ch.label if len(channels) > 1 else pname}",
+                            stream=True)
                         verdict, gate_prefetched, reason = _peek_stream(
                             gate_opened, model=model, uid=ch.label)
                         if verdict == "bad":
+                            registry.finish(peek_rid, "gate")
                             r = None
                             activity.add(
                                 "warn",
@@ -2187,8 +2274,12 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                             gate_opened = None
                             gate_prefetched = None
                             continue
-                        # 判健康：client 生命周期归 _stream_body
-                        # 的 finally 收尾（与无门时一致）
+                        # 判健康：peek rid 立即终结（"peek"）——
+                        # 吐流阶段归 _stream_body 的 rid（见上方
+                        # 注释，不双重计数）；client 生命周期归
+                        # _stream_body 的 finally 收尾（与无门时
+                        # 一致）
+                        registry.finish(peek_rid, "peek")
                         gate_opened.client = client
                         break
                     break
@@ -2493,9 +2584,25 @@ def _forward_external(data: dict, model: str, prov: dict):
                                 # 慢 key 不能被冷却）；_peek_stream
                                 # 判负时已关闭 gate_opened（→r）。
                                 gate_opened = _UpstreamOpen(status=200, resp=r)
+                                # peek 期负载登记（T9 P3-7）：同主池——
+                                # 登记键与 _stream_body 的 load_key
+                                # 一致（f"key:{pname}|{label}"，
+                                # providers.py:214 load_of 查询键；
+                                # atomcode 通道 f"ac:{pname}|{label}"
+                                # 同理），peek 阻塞期间 key 负载
+                                # 不被低估；判健康立即 finish
+                                # ("peek")，吐流阶段归 _stream_body
+                                # 的 rid，不双重计数。
+                                peek_rid = registry.register(
+                                    model,
+                                    (f"ac:{pname}|{key_label}"
+                                     if is_ac
+                                     else f"key:{pname}|{key_label}"),
+                                    stream=True)
                                 verdict, gate_prefetched, reason = _peek_stream(
                                     gate_opened, model=model, uid=key_label)
                                 if verdict == "bad":
+                                    registry.finish(peek_rid, "gate")
                                     activity.add(
                                         "warn",
                                         f"{model} · {key_label} 流内嗅探判负"
@@ -2506,9 +2613,13 @@ def _forward_external(data: dict, model: str, prov: dict):
                                     gate_prefetched = None
                                     r = None
                                     continue
-                                # 判健康：client 生命周期归
-                                # _stream_body 的 finally 收尾
-                                # （与无门时一致）
+                                # 判健康：peek rid 立即终结
+                                # （"peek"）——吐流阶段归
+                                # _stream_body 的 rid（见上方
+                                # 注释，不双重计数）；client
+                                # 生命周期归 _stream_body 的
+                                # finally 收尾（与无门时一致）
+                                registry.finish(peek_rid, "peek")
                                 gate_opened.client = client
                                 return (r, key_label, client,
                                         gate_opened, gate_prefetched)
@@ -2659,6 +2770,9 @@ def v1_chat():
              req_model, req_keys, msg_count, data.get("stream", False))
     # 400 调试：完整请求体写入临时文件（0905 审计修正：默认关闭，config 加 debug_last_request=true 开启）
     if load_config().get("debug_last_request"):
+        # 互斥警示（T9 P2-6）：落盘的是未脱敏全文请求，
+        # 与语料 redact 管线互斥——限频提示，仅限本地排查
+        _debug_last_request_warn_once()
         import os, json as _json
         debug_path = os.path.join(os.path.dirname(__file__), "..", "last_request.json")
         with open(debug_path, "w", encoding="utf-8") as f:
