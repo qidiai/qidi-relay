@@ -25,6 +25,7 @@ os.environ.setdefault("CODELY_CLI_VERSION", "0.0.0-test")  # 供 subprocess 探 
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="qidi-relay-test-"))
 (TMP / "config.json").write_text(json.dumps({
     "port": 0,
+    "features": {"affinity": False},
     "pool_models": ["GLM-5.3", "KIMI-K3"],
     "model_groups": {},
     "providers": {},

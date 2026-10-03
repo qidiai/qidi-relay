@@ -157,11 +157,16 @@ class AccountManager:
         left = [x for x in left if x > 0]
         return round(min(left), 1) if left else None
 
-    def get_next(self, model: str = None, loads: dict = None):
+    def get_next(self, model: str = None, loads: dict = None,
+                 prefer: str = None):
         """轮询获取下一个可用账号；请求 GLM 系模型时优先有 GLM-5.3 的账号。
 
         loads: {user_id: 当前进行中请求数}；提供时在候选中优先选负载最低的
         （智能路由：避免把新的长请求压到已在扛 3 分钟长流的账号上）。
+        prefer: 会话粘性（阶段 B / 方案 v2 §4）给出的偏好账号 uid——
+        在分组/资格过滤后的候选内（启用、未冷却、符合模型
+        分组与 GLM/KIMI 资格）时直接选它（仍忽略负载感知），
+        否则走下方原逻辑；其余调用点不传，行为不变。
         """
         if not self.accounts:
             return None
@@ -246,6 +251,24 @@ class AccountManager:
                     log.warning("GLM 回退: %s 候选组无 GLM 权限账号，改用 %s",
                                 model, [a["user_id"] for a in glm_all])
                     enabled = glm_all
+
+        # 会话粘性（阶段 B / 方案 §4）：prefer 账号在分组/
+        # 资格过滤后的候选内（启用、未冷却、符合模型分组与
+        # GLM/KIMI 资格）时直接选它（仍忽略负载感知）；不在
+        # 候选内（冷却中/禁用/资格不符/池已变）则回落下方
+        # 轮转逻辑。注意：上方反向隔离的 return None（订阅
+        # 号全灭 = 503+Retry-After）先于此生效——绝不为粘
+        # 会话烧 free 组账号。
+        if prefer:
+            for a in enabled:
+                if a["user_id"] == prefer:
+                    log.info("会话粘性: %s → 账号 %s",
+                             model or "-", prefer)
+                    with self._lock:
+                        a["last_used"] = datetime.now().isoformat()
+                        a["use_count"] = a.get("use_count", 0) + 1
+                        self._save()
+                    return a
 
         # 负载感知：候选里负载最低的优先（同负载保持轮询顺序）
         if loads:

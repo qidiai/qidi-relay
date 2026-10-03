@@ -16,6 +16,7 @@ from flask import Blueprint, jsonify, request
 
 from proxy_core import providers
 from proxy_core import cline
+from proxy_core import affinity
 from proxy_core import minicode
 from proxy_core.atomcode import _default_auth_path, all_channels, channels_for, parse_auth_text
 from proxy_core.auth import check_admin_auth, hash_password, is_authorized, session_token, verify_password
@@ -86,6 +87,19 @@ def api_gate():
             "busy": cline._gate_busy,
             "waiting": cline._gate_waiters,
         }})
+
+
+# ─── 会话粘性观测（阶段 B / 方案 v2 §4）──────────────────────────────────────────────
+
+@bp.route("/affinity/stats")
+@check_admin_auth
+def api_affinity_stats():
+    """会话粘性观测（方案 §4）：stuck_sessions=当前粘连
+    会话数（内存表锁内快照，24h 过期条目已清出）；
+    why_distribution=粘性决策 why 计数分布。"""
+    stuck, dist = affinity.snapshot()
+    return jsonify({"stuck_sessions": stuck,
+                    "why_distribution": dist})
 
 
 # ─── 账号管理 ────────────────────────────────────────────────────────────────

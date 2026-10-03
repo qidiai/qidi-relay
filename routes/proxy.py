@@ -23,6 +23,7 @@ from proxy_core import providers
 from proxy_core import cline
 from proxy_core import minicode
 from proxy_core import anthropic
+from proxy_core import affinity
 from proxy_core.accounts import AUTH_COOLDOWN_S, QUOTA_COOLDOWN_S
 from proxy_core.atomcode import channels_for, pick_channel
 from proxy_core.keystore import build_litellm_headers, session_pool
@@ -376,9 +377,25 @@ def _feature_stream_gate() -> bool:
     """流内嗅探门开关（features.stream_gate，键缺省视为开启）。
 
     每请求现读 config——与 load_config().get("model_groups") 同风格，
-    改 config.json 不必重启即生效。
+    改 config.json 不必重启即生效。features 非 dict 时安全
+    回落缺省值（防御式取值，与门内容判定同纪律）。
     """
-    return load_config().get("features", {}).get("stream_gate", True)
+    feats = load_config().get("features")
+    return (feats.get("stream_gate", True)
+            if isinstance(feats, dict) else True)
+
+
+def _feature_affinity() -> bool:
+    """会话粘性开关（features.affinity，键缺省视为开启，
+    与 stream_gate 同风格）。
+
+    每请求现读 config——与 _feature_stream_gate 同风格，
+    改 config.json 不必重启即生效。features 非 dict 时安全
+    回落缺省值（防御式取值，与门内容判定同纪律）。
+    """
+    feats = load_config().get("features")
+    return (feats.get("affinity", True)
+            if isinstance(feats, dict) else True)
 
 
 # 嗅探门内容判定的字段集（OpenAI 形流式帧，防御式逐字段取）
@@ -554,7 +571,9 @@ def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
 
 def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                  sess=None, key_label: str | None = None,
-                 load_key: str | None = None, prefetched=None):
+                 load_key: str | None = None, prefetched=None,
+                 session_key: str | None = None,
+                 turn_boundary: bool | None = None):
     """把已确认 200 的上游流吐给客户端，边吐边提取 usage 与上游实际模型名。
 
     首字节已出 → HTTP 状态码改不了，中途失败只能用 in-band SSE 错误事件收尾。
@@ -562,6 +581,8 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     load_key 是并发负载登记用的键（外部通道带前缀，与 pick_key 的查询键一致）。
     prefetched 非 None = 嗅探门已预读的字节块列表：先逐个消化（客户端
     一个字节不丢），再续读同一上游流；为 None 时行为与无门时逐字节一致。
+    session_key/turn_boundary = 会话粘性（阶段 B / 方案 §4，v1 仅主池）：
+    usage 记账后调 affinity.record 更新内存表；外部通道不传（不记录）。
     """
     usage_captured = None
     line_buf = ""
@@ -640,6 +661,15 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
         if key_label:
             # 流式生成器已在请求上下文之外运行，label 由调用方提前捕获传入
             token_stats.record_key(key_label, model, usage_captured)
+    # 会话粘性记录（阶段 B / 方案 §4，v1 仅主池）：
+    # 仅成功路径（上游吐 [DONE] 终止符，saw_done=True）
+    # 才更新内存表——截断流不得覆写粘性记忆（"成功才
+    # 记忆"语义）；except 分支已 return 提前退出，天然
+    # 不达此处。外部三通道不传 session_key → 不记录
+    # （粘性作用域仅主池）。
+    if session_key and saw_done:
+        affinity.record(session_key, uid, model, usage_captured,
+                        turn_boundary)
     # 知识库记录（0905）：流式成功
     kdb.record_request(
         user_id=uid, model_requested=model,
@@ -952,8 +982,37 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
     # 流式生成器运行在请求上下文之外，label 必须提前捕获（按 key 记账用）
     key_label = getattr(g, "api_key_label", None) if has_request_context() else None
 
+    # 会话粘性（阶段 B / 方案 v2 §4，v1 仅主池）：选号前计算
+    # 会话键（四级 fallback）与粘性偏好。features.affinity=False
+    # → 完全不计算、不传 prefer、不 record（客户端可见行为与
+    # 升级前逐字节一致）。
+    affinity_skey = None
+    affinity_turn = None
+    affinity_prefer = None
+    if _feature_affinity():
+        affinity_skey = affinity.session_key(
+            data,
+            request.headers if has_request_context() else None,
+            key_label,
+            request.remote_addr if has_request_context() else None)
+        # turn 判定（双协议）：工具循环内的续请求
+        # （messages[-1] 是工具回传）与上一请求同 turn
+        affinity_turn = not affinity.is_turn_continuation(data)
+        affinity_prefer, aff_why = affinity.pick_prefer(
+            affinity_skey, affinity_turn)
+        if affinity_prefer is None and aff_why != affinity.WHY_COLD:
+            # 粘性漂移：本会话原有粘连记忆但本次不粘
+            # （账号冷却/配额耗尽/禁用，或跨 turn 缓存
+            # 证据不足）——info 级留痕，面板可查
+            activity.add("info",
+                         f"{model} · 会话粘性漂移（{aff_why}）",
+                         model=model, status="affinity")
+
     last_open = None
     last_uid = "?"
+    # 本请求已试过的账号：粘性偏好不重复撞（否则
+    # 换号循环会凭记忆在同一账号上烧尽 attempt）
+    affinity_tried: set = set()
     for _attempt in range(max_attempts):
         # 负载每轮重算：上一轮换号可能已让某账号多出一条长流
         loads = {a["user_id"]: registry.load_of(a["user_id"]) for a in am.accounts}
@@ -962,7 +1021,11 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
         # 命中 <账号ID>）；全池只剩它时兜底仍会选它，不影响可用性。
         if last_uid != "?":
             loads[last_uid] = (max(loads.values()) if loads else 0) + 1
-        acc = am.get_next(model, loads=loads)
+        # 粘性偏好只作用于本请求未试过的账号
+        eff_prefer = (affinity_prefer
+                      if affinity_prefer not in affinity_tried
+                      else None)
+        acc = am.get_next(model, loads=loads, prefer=eff_prefer)
         if not acc:
             # 全部冷却/禁用：有上游失败记录就报那个状态码，否则 503 + Retry-After
             if last_open is not None:
@@ -970,6 +1033,7 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
             return _pool_exhausted(model)
 
         uid = acc["user_id"]
+        affinity_tried.add(uid)
         key = api_cache.get(acc)
         if not key:
             return _openai_error("获取 API Key 失败", "proxy_config_error",
@@ -1002,10 +1066,14 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                         continue
                     return Response(
                         _stream_body(opened, model, uid, started, sess,
-                                     key_label, prefetched=prefetched),
+                                     key_label, prefetched=prefetched,
+                                     session_key=affinity_skey,
+                                     turn_boundary=affinity_turn),
                         content_type="text/event-stream")
                 return Response(_stream_body(opened, model, uid, started,
-                                             sess, key_label),
+                                             sess, key_label,
+                                             session_key=affinity_skey,
+                                             turn_boundary=affinity_turn),
                                 content_type="text/event-stream")
             session_pool.release(sess)
             last_open, last_uid = opened, uid
@@ -1082,6 +1150,11 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                 if usage:
                     token_stats.record(uid, model, usage)
                     _record_key_usage(model, usage)
+                # 会话粘性记录（阶段 B / 方案 §4，v1 仅主池）：
+                # 非流式在 usage 记账处同样调用
+                if affinity_skey:
+                    affinity.record(affinity_skey, uid, model, usage,
+                                    affinity_turn)
                 # 知识库记录（0905）：非流式池成功
                 kdb.record_request(
                     user_id=uid, model_requested=model,

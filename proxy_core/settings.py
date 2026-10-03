@@ -11,6 +11,12 @@ ACCOUNTS_FILE = BASE_DIR / "accounts.json"
 STATS_FILE = BASE_DIR / "token_stats.json"
 WATER_FILE = BASE_DIR / "water_check.json"
 LOG_FILE = BASE_DIR / "proxy.log"
+# 会话粘性记忆（阶段 B / 方案 v2 §4）：内存表 +
+# 后台线程 ≤2s 周期原子落盘（tmp+rename）。路径
+# 常量可注入（测试重定向到 TMP——方案 §7.7 纪律：
+# 新模块一律走 settings.py 路径常量模式，禁止
+# seedguard 式 BASE_DIR 兜底直写仓库数据文件）。
+CONVERSATIONS_FILE = BASE_DIR / "conversations.json"
 
 LITELLM_API_BASE = "https://codely-litellm.tuanjie.cn"
 CLI_API_KEY_FETCH_URL = "https://codely.tuanjie.cn/api/api-token/cli-api-key"

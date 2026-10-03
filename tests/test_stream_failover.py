@@ -20,6 +20,7 @@ os.environ.setdefault("CODELY_CLI_VERSION", "0.0.0-test")  # 免 subprocess 探�
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="qidi-relay-test-"))
 (TMP / "config.json").write_text(json.dumps({
     "port": 0,
+    "features": {"affinity": False},
     "pool_models": ["GLM-5.3", "KIMI-K3"],
     "model_groups": {},
     "providers": {},
@@ -1111,3 +1112,22 @@ def test_external_provider_quota_cooldown():
         cfg["providers"] = old_provs
         S.CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
         RP._prov_quota_cooldown.pop("mockprov", None)
+
+
+def test_affinity_feature_off_leaves_no_memory():
+    """features.affinity=false（本文件 TMP config 显式关闭）：
+    请求成功后粘性内存表保持为空——本文件测的是前亲和
+    行为，会话粘性绝不介入（基线保护：显式关开关；
+    conftest 兜底重定向 conversations.json，双保险）。"""
+    from proxy_core import affinity as AFF
+    _reset({"key-9001": "200", "key-9002": "200", "key-9003": "200"})
+    # 全量收集时更早文件的用例可能已留粘性记忆——
+    # 本用例只断言"本文件请求期间零写入"，先清零
+    with AFF._LOCK:
+        AFF._TABLE.clear()
+        AFF._WHY.clear()
+        AFF._DIRTY = False
+    assert _post(stream=False).status_code == 200
+    with AFF._LOCK:
+        assert len(AFF._TABLE) == 0, "开关关闭时不得 record"
+        assert len(AFF._WHY) == 0
