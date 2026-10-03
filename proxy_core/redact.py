@@ -16,9 +16,9 @@
     client_secret / secret / token 类键的值整值抹除
     （对 dict/list 递归——比纯正则强，magpie
     redact.go:73-79 同思路）
-  个人数据：邮箱（默认打码）/ 手机号 / 身份证（含校验
-    位——简化为位数规则）/ 银行卡（luhn 可选简化——
-    按 13-19 位数字规则）/ 内网 IPv4 / IPv6 link-local
+  个人数据：邮箱（默认打码）/ 手机号 / 身份证（18 位
+    GB 11643 校验位验证）/ 银行卡（13-19 位 + luhn
+    校验位验证）/ 内网 IPv4 / IPv6 link-local
   路径：整段绝对路径打码至盘符（云端实测语料含
     G:\\qidicode 工作区路径与 AGENTS.md 全文，不止
     用户目录形态）
@@ -83,11 +83,41 @@ _EMAIL_RE = re.compile(
     r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 # 手机号（大陆 11 位，1[3-9] 号段）
 _PHONE_RE = re.compile(r"\b1[3-9]\d{9}\b")
-# 身份证（18 位含校验位——简化为位数规则：首位非零、末位可 X）
+# 身份证（18 位：首位非零、末位可 X——T9 R7 加 GB 11643
+# 校验位验证，正则位数命中后再验校验位）
 _ID_CARD_RE = re.compile(r"\b[1-9]\d{16}[0-9Xx]\b")
-# 银行卡（luhn 可选简化——按 13-19 位数字规则；排在身份证
-# 之后，18 位身份证不会被重复计数）
+# 银行卡（13-19 位数字——T9 R7 加 luhn 校验位验证；排在
+# 身份证之后，18 位身份证不会被重复计数）
 _BANK_CARD_RE = re.compile(r"\b\d{13,19}\b")
+
+# GB 11643 身份证校验位（T9 R7）：前 17 位加权求和
+# 模 11，映射表取校验码与第 18 位比对
+_ID_CARD_W = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7,
+              9, 10, 5, 8, 4, 2)
+_ID_CARD_CHECK = "10X98765432"
+
+
+def _id_card_valid(pid: str) -> bool:
+    """GB 11643 身份证 18 位校验位验证。"""
+    if len(pid) != 18:
+        return False
+    total = sum(int(pid[i]) * _ID_CARD_W[i]
+                for i in range(17))
+    return _ID_CARD_CHECK[total % 11] == pid[17].upper()
+
+
+def _luhn_valid(num: str) -> bool:
+    """Luhn 银行卡校验位验证（输入为纯数字——
+    由 _BANK_CARD_RE 位数命中保证）。"""
+    total = 0
+    for i, ch in enumerate(reversed(num)):
+        d = int(ch)
+        if i % 2 == 1:          # 从右数第二位起翻倍
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
 # 内网 IPv4：10/8、172.16/12、192.168/16、127/8、169.254/16
 _PRIVATE_V4_RE = re.compile(
     r"\b("
@@ -203,6 +233,22 @@ def redact_text(s, extra=None):
         text, n = pattern.subn(repl, text)
         hits += n
 
+    def _apply_validated(pattern, repl, validator):
+        """带校验位验证的替换（T9 R7：身份证 GB 11643
+        / 银行卡 luhn）——正则先按位数命中，validator
+        通过才打码；校验不通过的号码保留原文（不误伤），
+        hits 只计验证通过的。"""
+        nonlocal text, hits
+
+        def _repl(m):
+            nonlocal hits
+            if validator(m.group(0)):
+                hits += 1
+                return repl
+            return m.group(0)
+
+        text = pattern.sub(_repl, text)
+
     # 顺序有语义：URL 凭证先于邮箱（否则 "pass@host"
     # 会被邮箱规则半截命中）；身份证先于银行卡（18 位
     # 身份证同时满足 13-19 位银行卡规则，先命中先抹除
@@ -212,8 +258,8 @@ def redact_text(s, extra=None):
     _apply(_TOKEN_RE, MASK)
     _apply(_EMAIL_RE, MASK)
     _apply(_PHONE_RE, MASK)
-    _apply(_ID_CARD_RE, MASK)
-    _apply(_BANK_CARD_RE, MASK)
+    _apply_validated(_ID_CARD_RE, MASK, _id_card_valid)
+    _apply_validated(_BANK_CARD_RE, MASK, _luhn_valid)
     _apply(_PRIVATE_V4_RE, MASK)
     _apply(_IPV6_LL_RE, MASK)
     # 整段绝对路径打码至盘符（保留盘符 + 根分隔符）

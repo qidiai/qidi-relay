@@ -262,9 +262,11 @@ def test_08_id_card_negative():
 # ─── ⑨ 银行卡 ───────────────────────────────────────
 
 def test_09_bank_card_positive():
-    out, hits = R.redact_text("银行卡 6222021234567890123 已绑定")
+    # T9 R7（指挥官授权修 fixture）：原号 6222021234567890123
+    # luhn 校验无效，与真 luhn 实现冲突——改同前缀合法号
+    out, hits = R.redact_text("银行卡 6222021234567890128 已绑定")
     assert hits == 1
-    assert "6222021234567890123" not in out
+    assert "6222021234567890128" not in out
 
 
 def test_09_bank_card_negative():

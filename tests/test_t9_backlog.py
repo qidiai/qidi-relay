@@ -90,6 +90,7 @@ import proxy_core.water as WA  # noqa: E402
 import proxy_core.providers as PV  # noqa: E402
 from proxy_core import corpus as CO  # noqa: E402
 from proxy_core import budget as BUDGET  # noqa: E402
+from proxy_core import redact as REDACT  # noqa: E402
 
 import routes.proxy as RP  # noqa: E402
 from proxy_core.state import am, api_cache, token_stats  # noqa: E402
@@ -580,3 +581,41 @@ def test_dup_warning_identical_spelling_message():
     assert "pricing.dup" in ws[0]
     assert "重复出现" in ws[0] and "两处拼写完全相同" in ws[0]
     assert " 与 " not in ws[0]
+
+
+# ─── ④ P2-4 真 luhn/身份证校验位（R7 补实现）──────
+
+def test_redact_bank_card_luhn_valid_redacted():
+    """④银行卡 luhn 通过（合法号
+    6222021234567890128）→ 打码。"""
+    out, hits = REDACT.redact_text(
+        "银行卡 6222021234567890128 已绑定")
+    assert hits == 1
+    assert "6222021234567890128" not in out
+
+
+def test_redact_bank_card_luhn_invalid_kept():
+    """④银行卡 luhn 失败（原 fixture 号
+    6222021234567890123）→ 保留原文不误伤。"""
+    s = "银行卡 6222021234567890123 已绑定"
+    out, hits = REDACT.redact_text(s)
+    assert hits == 0
+    assert out == s
+
+
+def test_redact_id_card_check_digit_valid_redacted():
+    """④身份证 GB 11643 校验位通过
+    （110101199003077758）→ 打码。"""
+    out, hits = REDACT.redact_text(
+        "身份证号 110101199003077758 已验证")
+    assert hits == 1
+    assert "110101199003077758" not in out
+
+
+def test_redact_id_card_check_digit_invalid_kept():
+    """④身份证末位校验错误（…759）→
+    保留原文不误伤。"""
+    s = "身份证号 110101199003077759 校验错"
+    out, hits = REDACT.redact_text(s)
+    assert hits == 0
+    assert out == s
