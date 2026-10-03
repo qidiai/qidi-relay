@@ -1,0 +1,35 @@
+# QiDi Relay v4 - git baseline .gitignore (2026-10-03)
+# Secrets & credentials (never commit)
+config.json
+config.json.bak*
+config.json.tmp
+accounts.json
+auths/
+agnes api.xlsx
+
+# Runtime state & data
+token_stats.json
+water_check.json
+seed_state.json
+relay_knowledge.db
+relay_knowledge.db-shm
+relay_knowledge.db-wal
+corpus_local/
+corpus_state.json
+media/
+
+# Logs
+*.log
+*.log.1
+*.log.2
+
+# Dev instance & caches & backups
+_dev8899/
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.bak_*
+
+# Large binaries
+hunyuanocr/models/

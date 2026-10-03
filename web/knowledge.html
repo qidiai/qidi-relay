@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>知识库 · QiDi Relay</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+       background:#0d1117; color:#e6edf3; padding:20px; }
+h1 { font-size:20px; margin-bottom:16px; color:#58a6ff; }
+h2 { font-size:15px; margin:16px 0 8px; color:#e6edf3; }
+
+.cards { display:flex; gap:12px; margin-bottom:20px; flex-wrap:wrap; }
+.card { background:#161b22; border:1px solid #30363d; border-radius:8px;
+        padding:14px 18px; min-width:130px; flex:1; }
+.card .num { font-size:22px; font-weight:bold; color:#58a6ff; }
+.card .lbl { font-size:12px; color:#8b949e; margin-top:4px; }
+
+.querybox { display:flex; gap:8px; margin-bottom:12px; }
+.querybox input { flex:1; background:#161b22; border:1px solid #30363d;
+                  color:#e6edf3; padding:10px 12px; border-radius:6px;
+                  font-family:monospace; font-size:13px; }
+.querybox button { background:#238636; color:#fff; border:none;
+                   padding:10px 18px; border-radius:6px; cursor:pointer;
+                   font-size:13px; white-space:nowrap; }
+.querybox button:hover { background:#2ea043; }
+.querybox button.sec { background:#30363d; }
+.querybox button.sec:hover { background:#444c56; }
+
+.presets { margin-bottom:12px; }
+.presets button { background:#21262d; border:1px solid #30363d; color:#8b949e;
+                  padding:5px 10px; border-radius:12px; cursor:pointer;
+                  font-size:11px; margin:2px 4px 2px 0; }
+.presets button:hover { border-color:#58a6ff; color:#58a6ff; }
+
+table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+th { background:#161b22; color:#8b949e; text-align:left; padding:8px 10px;
+     border-bottom:1px solid #30363d; font-weight:500; white-space:nowrap; }
+td { padding:7px 10px; border-bottom:1px solid #21262d; color:#e6edf3;
+     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px; }
+tr:hover td { background:#161b22; }
+
+.login { background:#161b22; border:1px solid #f85149; border-radius:8px;
+         padding:20px; text-align:center; }
+.login input { background:#0d1117; border:1px solid #30363d; color:#e6edf3;
+               padding:10px 14px; border-radius:6px; width:200px; }
+.login button { background:#238636; color:#fff; border:none; padding:10px 18px;
+                border-radius:6px; cursor:pointer; margin-left:8px; }
+.error { color:#f85149; font-size:13px; margin:8px 0; }
+.ok { color:#3fb950; }
+.back { position:absolute; top:20px; right:20px; }
+.back a { color:#8b949e; text-decoration:none; font-size:13px; }
+.back a:hover { color:#58a6ff; }
+.export-bar { margin:12px 0; }
+.export-bar button { background:#1f6feb; color:#fff; border:none;
+                     padding:8px 14px; border-radius:6px; cursor:pointer; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="back"><a href="/">← 返回管理面板</a></div>
+<h1>📚 知识库 · Relay Knowledge DB</h1>
+
+<div id="loginDiv" class="login" style="display:none">
+  <p style="margin-bottom:12px;color:#8b949e">输入管理面板密码访问知识库</p>
+  <input type="password" id="pwdInput" placeholder="管理密码" onkeydown="if(event.key==='Enter')doLogin()">
+  <button onclick="doLogin()">登录</button>
+  <p class="error" id="loginErr"></p>
+</div>
+
+<div id="main" style="display:none">
+  <div class="cards" id="cards"></div>
+
+  <h2>SQL 查询（只读 SELECT）</h2>
+  <div class="presets">
+    <button onclick="preset('SELECT id, ts, user_id, model_requested, model_served, total_tokens, status_code, is_stream, effort FROM requests ORDER BY id DESC LIMIT 50')">最近 50 条请求</button>
+    <button onclick="preset('SELECT model_requested, COUNT(*) as cnt, SUM(total_tokens) as tokens FROM requests GROUP BY model_requested ORDER BY tokens DESC')">模型用量汇总</button>
+    <button onclick="preset('SELECT model, status_code, COUNT(*) as cnt FROM errors GROUP BY model, status_code ORDER BY cnt DESC')">错误统计</button>
+    <button onclick="preset('SELECT strftime(\'%m-%d %H\', ts) as hour, COUNT(*) as reqs, SUM(total_tokens) as tokens FROM requests WHERE ts >= datetime(\'now\', \'localtime\', \'-24 hours\') GROUP BY hour ORDER BY hour')">24h 用量趋势</button>
+    <button onclick="preset('SELECT user_id, COUNT(*) as reqs, SUM(total_tokens) as tokens FROM requests GROUP BY user_id ORDER BY tokens DESC')">账号用量</button>
+  </div>
+  <div class="querybox">
+    <input type="text" id="sqlInput" placeholder="SELECT ... FROM requests/errors LIMIT 100">
+    <button onclick="runQuery()">执行</button>
+  </div>
+  <p class="error" id="queryErr"></p>
+
+  <div class="export-bar">
+    <button onclick="exportCSV('requests')">⬇ 导出 requests.csv</button>
+    <button onclick="exportCSV('errors')">⬇ 导出 errors.csv</button>
+  </div>
+
+  <h2>查询结果 <span id="rowCount" style="font-weight:400;color:#8b949e;font-size:12px"></span></h2>
+  <div style="overflow-x:auto">
+    <table id="resultTable"></table>
+  </div>
+</div>
+
+<script>
+let pwd = '';
+
+function doLogin() {
+  pwd = document.getElementById('pwdInput').value;
+  fetch('/api/db/summary', {
+    headers: {'Authorization': 'Bearer ' + pwd}
+  }).then(r => {
+    if (r.status === 401 || r.status === 403) throw new Error('密码错误');
+    return r.json();
+  }).then(loadMain).catch(e => {
+    document.getElementById('loginErr').textContent = e.message;
+  });
+}
+
+function loadMain(d) {
+  document.getElementById('loginDiv').style.display = 'none';
+  document.getElementById('main').style.display = 'block';
+  let cards = [
+    ['total_requests', '总请求数'],
+    ['total_errors', '总错误数'],
+    ['models_used', '使用模型数'],
+    ['db_size_kb', 'DB 大小(KB)'],
+  ].map(([k, l]) => `<div class="card"><div class="num">${d[k] ?? '—'}</div><div class="lbl">${l}</div></div>`).join('');
+  document.getElementById('cards').innerHTML = cards;
+  preset('SELECT id, ts, user_id, model_requested, model_served, total_tokens, status_code, is_stream, effort FROM requests ORDER BY id DESC LIMIT 50');
+}
+
+function preset(sql) {
+  document.getElementById('sqlInput').value = sql;
+  runQuery();
+}
+
+function runQuery() {
+  let sql = document.getElementById('sqlInput').value.trim();
+  if (!sql) return;
+  document.getElementById('queryErr').textContent = '';
+  fetch('/api/db/query?sql=' + encodeURIComponent(sql), {
+    headers: {'Authorization': 'Bearer ' + pwd}
+  }).then(r => r.json()).then(d => {
+    if (d.error) throw new Error(d.error);
+    let table = document.getElementById('resultTable');
+    document.getElementById('rowCount').textContent = `(${d.count} 行${d.truncated ? '，已截断' : ''})`;
+    if (!d.data || d.data.length === 0) {
+      table.innerHTML = '<tr><td style="color:#8b949e">无数据</td></tr>';
+      return;
+    }
+    let cols = Object.keys(d.data[0]);
+    let html = '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+    d.data.forEach(row => {
+      html += '<tr>' + cols.map(c => `<td title="${String(row[c] ?? '')}">${row[c] ?? ''}</td>`).join('') + '</tr>';
+    });
+    table.innerHTML = html;
+  }).catch(e => {
+    document.getElementById('queryErr').textContent = e.message;
+  });
+}
+
+function exportCSV(table) {
+  window.open(`/api/db/export?table=${table}&limit=50000`, '_blank');
+}
+
+// 尝试用已有 cookie 自动登录
+fetch('/api/db/summary').then(r => {
+  if (r.ok) return r.json();
+  throw new Error();
+}).then(loadMain).catch(() => {
+  document.getElementById('loginDiv').style.display = 'block';
+});
+</script>
+</body>
+</html>

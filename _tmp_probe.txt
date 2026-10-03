@@ -1,0 +1,20 @@
+
+===== 账号 <账号ID> (group=(Lite订阅)) =====
+  可用模型(7): KIMI-K3, GLM-5.3-FLASH, codely-basic, codely-core, codely-flash, codely-air, codely-vl
+  GLM-5.3: ❌ | GLM-5.3-FLASH: ✅ | KIMI-K3: ✅
+
+===== 账号 <账号ID> (group=free) =====
+  可用模型(5): codely-basic, codely-core, codely-flash, codely-air, codely-vl
+  GLM-5.3: ❌ | GLM-5.3-FLASH: ❌ | KIMI-K3: ❌
+
+===== 账号 <账号ID> (group=(Lite订阅)) =====
+  可用模型(7): KIMI-K3, GLM-5.3-FLASH, codely-basic, codely-core, codely-flash, codely-air, codely-vl
+  GLM-5.3: ❌ | GLM-5.3-FLASH: ✅ | KIMI-K3: ✅
+
+===== 账号 <账号ID> (group=free) =====
+  可用模型(5): codely-basic, codely-core, codely-flash, codely-air, codely-vl
+  GLM-5.3: ❌ | GLM-5.3-FLASH: ❌ | KIMI-K3: ❌
+
+===== 账号 <账号ID> (group=pro) =====
+  可用模型(7): KIMI-K3, GLM-5.3-FLASH, codely-basic, codely-core, codely-flash, codely-air, codely-vl
+  GLM-5.3: ❌ | GLM-5.3-FLASH: ✅ | KIMI-K3: ✅

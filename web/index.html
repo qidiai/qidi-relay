@@ -1,0 +1,241 @@
+﻿<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QiDi Relay · 局域网中转控制台</title>
+<link rel="stylesheet" href="/static/app.css?v=45">
+</head>
+<body>
+<canvas id="bg-canvas"></canvas>
+<div class="scanlines"></div>
+
+<!-- ═══ 顶栏 ═══ -->
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 40 40" aria-hidden="true">
+      <polygon points="20,3 35,11.5 35,28.5 20,37 5,28.5 5,11.5" fill="none" stroke="currentColor" stroke-width="2"/>
+      <circle cx="20" cy="20" r="5" fill="currentColor"/>
+      <line x1="20" y1="8" x2="20" y2="15" stroke="currentColor" stroke-width="2"/>
+      <line x1="30.5" y1="26" x2="24.5" y2="22.5" stroke="currentColor" stroke-width="2"/>
+      <line x1="9.5" y1="26" x2="15.5" y2="22.5" stroke="currentColor" stroke-width="2"/>
+    </svg>
+    <div class="brand-text">
+      <h1>QiDi&nbsp;Relay</h1>
+      <span class="sub">LAN PROXY CONSOLE // v<span id="ver">4</span></span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="clock"><span id="clock">--:--:--</span><span class="clock-label">LOCAL</span></div>
+    <div class="status-pill" id="status-pill">
+      <span class="led" id="status-led"></span><span id="status-text">连接中…</span>
+    </div>
+    <button class="btn ghost" id="logoutBtn" style="display:none" onclick="logout()">退出</button>
+  </div>
+</header>
+
+<!-- ═══ KPI 指标带 ═══ -->
+<section class="kpi-strip">
+  <div class="kpi"><div class="kpi-label">累计请求</div><div class="kpi-val" id="kpi-requests">0</div><div class="kpi-spark" id="kpi-req-sub">REQ</div></div>
+  <div class="kpi"><div class="kpi-label">累计 TOKEN</div><div class="kpi-val cyan" id="kpi-tokens">0</div><div class="kpi-spark" id="kpi-tok-sub">TOK</div></div>
+  <div class="kpi"><div class="kpi-label">活跃账号</div><div class="kpi-val green" id="kpi-accounts">0/0</div><div class="kpi-spark" id="kpi-acc-sub">POOL</div></div>
+  <div class="kpi"><div class="kpi-label">运行时长</div><div class="kpi-val magenta" id="kpi-uptime">--</div><div class="kpi-spark">UPTIME</div></div>
+</section>
+
+<!-- ═══ 主网格 ═══ -->
+<main class="grid">
+
+  <!-- 接入信息 -->
+  <section class="panel" id="panel-connect">
+    <div class="panel-head">
+      <h2>接入信息 <span class="tag">QUICK LINK</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="endpoint-row">
+        <span class="ep-label">BASE&nbsp;URL</span>
+        <code class="ep-val" id="endpoint-url">…</code>
+        <button class="btn tiny" onclick="copyText(document.getElementById('endpoint-url').textContent, this)">复制</button>
+      </div>
+      <div class="endpoint-row">
+        <span class="ep-label">API&nbsp;KEY</span>
+        <code class="ep-val">sk-anything（任意值，代理自动轮换账号）</code>
+        <button class="btn tiny" onclick="copyText('sk-anything', this)">复制</button>
+      </div>
+      <div class="snippet-tabs">
+        <button class="stab active" data-snippet="curl">cURL</button>
+        <button class="stab" data-snippet="python">Python</button>
+        <button class="stab" data-snippet="js">JS / Node</button>
+        <button class="btn tiny copy-snippet" onclick="copySnippet(this)">复制代码</button>
+      </div>
+      <pre class="snippet" id="snippet-box"></pre>
+    </div>
+  </section>
+
+  <!-- 用量趋势 -->
+  <section class="panel wide" id="panel-trend">
+    <div class="panel-head">
+      <h2>用量趋势 <span class="tag">TREND</span></h2>
+      <div class="head-actions">
+        <button class="stab active" data-hours="24">24H</button>
+        <button class="stab" data-hours="72">72H</button>
+        <button class="stab" data-hours="168">7D</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <canvas id="trend-canvas" height="180"></canvas>
+      <div class="legend">
+        <span><i class="dot cyan"></i>输入 Token</span>
+        <span><i class="dot magenta"></i>输出 Token</span>
+        <span><i class="dot green"></i>请求数（右轴）</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 账号矩阵 -->
+  <section class="panel wide" id="panel-accounts">
+    <div class="panel-head">
+      <h2>账号矩阵 <span class="tag" id="account-count-tag">0 ONLINE</span></h2>
+      <div class="head-actions">
+        <button class="btn tiny" onclick="refreshAccounts()" title="重新加载 accounts.json 并清空 Key 缓存">重载</button>
+        <button class="btn tiny" onclick="checkModels()" title="检查各账号 GLM-5.3 可用性">检测模型</button>
+        <button class="btn tiny primary" onclick="openModal('addModal')">+ 添加账号</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="account-grid" id="account-grid"></div>
+    </div>
+  </section>
+
+  <!-- 用量分布 -->
+  <section class="panel" id="panel-dist">
+    <div class="panel-head">
+      <h2>用量分布 <span class="tag">SHARE</span></h2>
+      <div class="head-actions">
+        <button class="stab active" data-dist="model">按模型</button>
+        <button class="stab" data-dist="account">按账号</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <canvas id="dist-canvas" height="200"></canvas>
+      <div class="dist-list" id="dist-list"></div>
+      <div class="danger-zone">
+        <button class="btn tiny danger" onclick="resetTokenStats()">清空全部统计</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 实时动态 -->
+  <section class="panel" id="panel-activity">
+    <div class="panel-head">
+      <h2>实时动态 <span class="tag blink">LIVE</span></h2>
+      <div class="head-actions">
+        <button class="btn tiny" id="activity-pause" onclick="toggleActivityPause(this)">暂停</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="feed" id="activity-feed"><div class="feed-empty">等待请求…</div></div>
+    </div>
+  </section>
+
+  <!-- API 测试台 -->
+  <section class="panel" id="panel-playground">
+    <div class="panel-head">
+      <h2>API 测试台 <span class="tag">PLAYGROUND</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="pg-row">
+        <select id="pg-model" class="input"><option value="">加载模型中…</option></select>
+        <input id="pg-apikey" class="input" type="password" placeholder="API Key（服务端启用鉴权时填写）" style="max-width:260px">
+        <label class="pg-stream"><input type="checkbox" id="pg-stream" checked> 流式</label>
+      </div>
+      <textarea id="pg-input" class="input" rows="3" placeholder="输入测试消息，回车发送（Shift+Enter 换行）">你好，用一句话介绍你自己。</textarea>
+      <div class="pg-row">
+        <button class="btn primary" id="pg-send" onclick="pgSend()">发 送</button>
+        <span class="pg-meta" id="pg-meta"></span>
+      </div>
+      <pre class="pg-output" id="pg-output">// 响应输出区 — 验证代理链路是否畅通</pre>
+    </div>
+  </section>
+
+  <!-- 日志终端 -->
+  <section class="panel wide" id="panel-logs">
+    <div class="panel-head">
+      <h2>系统日志 <span class="tag">SYSLOG</span></h2>
+      <div class="head-actions">
+        <button class="stab active" data-logfilter="all">全部</button>
+        <button class="stab" data-logfilter="INFO">INFO</button>
+        <button class="stab" data-logfilter="WARNING">WARN</button>
+        <button class="stab" data-logfilter="ERROR">ERROR</button>
+        <button class="btn tiny" id="log-pause" onclick="toggleLogPause(this)">暂停</button>
+        <button class="btn tiny" onclick="loadLogs(true)">刷新</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="terminal" id="log-terminal"></div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section class="panel" id="panel-settings">
+    <div class="panel-head">
+      <h2>安全设置 <span class="tag">AUTH</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="settings-row">
+        <span id="auth-state">未设置管理密码（局域网开放访问）</span>
+      </div>
+      <div class="settings-row btns">
+        <button class="btn tiny primary" onclick="openModal('configModal')">设置 / 修改密码</button>
+        <button class="btn tiny danger" onclick="clearPassword()">清除密码</button>
+      </div>
+      <p class="hint">设置密码后，管理接口需登录访问；密码以 SHA256 哈希存储，cookie 同样只存哈希。</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">QiDi Relay v4 · 模块化重构版 · 数据文件兼容 v3</footer>
+
+<!-- ═══ 登录闸门 ═══ -->
+<div class="gate" id="login-gate" style="display:none">
+  <div class="gate-box">
+    <div class="gate-title">ACCESS&nbsp;CONTROL</div>
+    <div class="gate-sub">请输入管理密码以解锁控制台</div>
+    <input type="password" id="login-pwd" class="input" placeholder="PASSWORD" autocomplete="current-password">
+    <button class="btn primary full" onclick="doLogin()">解 锁</button>
+    <div class="gate-err" id="login-err"></div>
+  </div>
+</div>
+
+<!-- ═══ 添加账号弹窗 ═══ -->
+<div class="modal" id="addModal">
+  <div class="modal-box">
+    <h3>添加账号</h3>
+    <label>账号 ID（user_id）</label><input class="input" id="addUserId" placeholder="如: <账号ID>">
+    <label>Access Token</label><input class="input" id="addToken" placeholder="eyJhbGci...">
+    <label>用户名（可选）</label><input class="input" id="addUsername" placeholder="如: wechat_os_xxx">
+    <label>组织 ID（可选）</label><input class="input" id="addOrgId" placeholder="如: 33264061842913">
+    <div class="modal-btns">
+      <button class="btn primary" onclick="addAccount()">保存</button>
+      <button class="btn ghost" onclick="closeModal('addModal')">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 密码弹窗 ═══ -->
+<div class="modal" id="configModal">
+  <div class="modal-box">
+    <h3>设置管理密码</h3>
+    <label>新密码</label><input class="input" id="newPwd" type="password" autocomplete="new-password">
+    <div class="modal-btns">
+      <button class="btn primary" onclick="saveConfig()">保存</button>
+      <button class="btn ghost" onclick="closeModal('configModal')">取消</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-zone" id="toast-zone"></div>
+
+<script src="/static/app.js?v=45"></script>
+</body>
+</html>
