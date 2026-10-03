@@ -37,6 +37,7 @@ from proxy_core.settings import (
     get_thinking_models,
     get_vision_capable_models,
     get_vision_model,
+    CONFIG_DUPLICATE_KEY_WARNINGS,
 )
 from proxy_core.state import SERVER_STARTED_AT, activity, am, api_cache, token_stats
 
@@ -112,6 +113,9 @@ def health():
         "endpoint": f"http://{request.host}",
         "uptime_seconds": uptime,
         "time": datetime.now().isoformat(),
+        # F 小修：config.json 重复键告警（大小写折叠后重复的键，
+        # 解析时后者覆盖前者）——缺省空表，只增键不改既有字段
+        "config_warnings": list(CONFIG_DUPLICATE_KEY_WARNINGS),
     })
 
 
@@ -539,11 +543,13 @@ def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
         return _finish_bad("empty_stream")
     except Exception as e:
         # peek 期间读流异常（读超时/连接断）：视同无内容超时判负
-        # 换号——不让单账号的流内死亡把整个请求拖成 500
+        # 换号——不让单账号的流内死亡把整个请求拖成 500。
+        # reason 附异常类型名（消费方只用 verdict 判负，
+        # reason 仅供日志/面板，不做枚举校验）
         log.warning("流内嗅探读流异常（%s，账号 %s）: %s", model, uid, e)
         opened.peek_iter = None
         opened.close()
-        return ("bad", [], "no_content_timeout")
+        return ("bad", [], f"peek_error: {type(e).__name__}")
 
 
 def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
@@ -1461,6 +1467,11 @@ def _forward_cline(data: dict, model: str, prov: dict):
         r = None
         ch = None
         last_status, last_snippet = 0, ""
+        # 嗅探门判健康后的开闸结果（prefetched 预读字节 +
+        # peek_iter 续读生成器）；门关时保持 None，行为与
+        # 升级前逐字节一致
+        gate_opened = None
+        gate_prefetched = None
         try:
             for _attempt in range(attempts):
                 ch = _pick()
@@ -1484,6 +1495,40 @@ def _forward_cline(data: dict, model: str, prov: dict):
                     time.sleep(1.5 + time.time() % 1)
                     continue
                 if r.status_code == 200:
+                    if _feature_stream_gate():
+                        # 流内嗅探门（T3 / 方案 v2 §3.2）：免费通道
+                        # 上游可能 200 后在流内报错/空流。peek 在
+                        # 换通道循环内同步执行，判负还能换通道。
+                        # 判负红线：与主池一致——只耗 attempt 预算
+                        # 换通道，绝不 set_cooldown（误判慢通道
+                        # 不能把它冷却掉）；_peek_stream 判负时
+                        # 已关闭 gate_opened（wrapper→r）。client
+                        # 是循环共享的，gate 对象不持有它，判负
+                        # 时不关。
+                        gate_opened = _UpstreamOpen(
+                            status=200,
+                            resp=cline.ClineStreamWrap(r, model))
+                        verdict, gate_prefetched, reason = _peek_stream(
+                            gate_opened, model=model, uid=ch.label)
+                        if verdict == "bad":
+                            r = None
+                            activity.add(
+                                "warn",
+                                f"{model} · 通道 {ch.label} 流内嗅探判负"
+                                f"（{reason}），换通道",
+                                model=model, user_id=ch.label,
+                                status="gate")
+                            # 复位：对齐 external（防同一请求
+                            # 重试期间 features.stream_gate 热改
+                            # True→False 时误用上一轮已关闭的
+                            # wrapper 与陈旧 prefetched）
+                            gate_opened = None
+                            gate_prefetched = None
+                            continue
+                        # 判健康：client 生命周期归 _stream_body
+                        # 的 finally 收尾（与无门时一致）
+                        gate_opened.client = client
+                        break
                     break
                 status = r.status_code
                 try:
@@ -1520,12 +1565,18 @@ def _forward_cline(data: dict, model: str, prov: dict):
                     "proxy_upstream_error", "external_credentials_unavailable", 503)
             key_label = ch.label if len(channels) > 1 else pname
             load_key = f"cl:{pname}|{key_label}"
+            if gate_opened is None:
+                # 门关（或本轮未走到门）：与升级前逐字节一致
+                gate_opened = _UpstreamOpen(
+                    status=200, resp=cline.ClineStreamWrap(r, model),
+                    client=client)
+            # 判健康时 gate_opened 已带 prefetched（peek 预读
+            # 字节，客户端一个都不丢）+ peek_iter（httpx 流
+            # 只能完整迭代一次，续读必须复用同一生成器）
             return Response(
-                _stream_body(_UpstreamOpen(status=200,
-                                           resp=cline.ClineStreamWrap(r, model),
-                                           client=client),
-                             model, key_label, started, None, client_key_label,
-                             load_key=load_key),
+                _stream_body(gate_opened, model, key_label, started, None,
+                             client_key_label, load_key=load_key,
+                             prefetched=gate_prefetched),
                 content_type="text/event-stream")
         except Exception as e:
             client.close()
@@ -1746,6 +1797,11 @@ def _forward_minicode(data: dict, model: str, prov: dict):
         r = None
         ch = None
         last_status, last_snippet = 0, ""
+        # 嗅探门判健康后的开闸结果（prefetched 预读字节 +
+        # peek_iter 续读生成器）；门关时保持 None，行为与
+        # 升级前逐字节一致
+        gate_opened = None
+        gate_prefetched = None
         try:
             for _attempt in range(attempts):
                 ch = _pick()
@@ -1768,6 +1824,42 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                     time.sleep(1.5 + time.time() % 1)
                     continue
                 if r.status_code == 200:
+                    if _feature_stream_gate():
+                        # 流内嗅探门（T3 / 方案 v2 §3.2）：上游原生
+                        # Anthropic 协议，但 MiniCodeStreamWrap 挂在
+                        # opened.resp 层——peek 的是翻译后的 OpenAI
+                        # 形字节（error 事件已被翻译成 OpenAI 错误块
+                        # → 判负；纯 thinking/tool_use 翻译结果都是
+                        # 内容 → 判健康）。判负红线：与主池一致——
+                        # 只耗 attempt 预算换通道，绝不 set_cooldown
+                        # （误判慢通道不能把它冷却掉）；_peek_stream
+                        # 判负时已关闭 gate_opened（wrapper→r）。
+                        # client 是循环共享的，gate 对象不持有它，
+                        # 判负时不关。
+                        gate_opened = _UpstreamOpen(
+                            status=200,
+                            resp=minicode.MiniCodeStreamWrap(r, model))
+                        verdict, gate_prefetched, reason = _peek_stream(
+                            gate_opened, model=model, uid=ch.label)
+                        if verdict == "bad":
+                            r = None
+                            activity.add(
+                                "warn",
+                                f"{model} · 通道 {ch.label} 流内嗅探判负"
+                                f"（{reason}），换通道",
+                                model=model, user_id=ch.label,
+                                status="gate")
+                            # 复位：对齐 external（防同一请求
+                            # 重试期间 features.stream_gate 热改
+                            # True→False 时误用上一轮已关闭的
+                            # wrapper 与陈旧 prefetched）
+                            gate_opened = None
+                            gate_prefetched = None
+                            continue
+                        # 判健康：client 生命周期归 _stream_body
+                        # 的 finally 收尾（与无门时一致）
+                        gate_opened.client = client
+                        break
                     break
                 status = r.status_code
                 try:
@@ -1803,12 +1895,19 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                     "proxy_upstream_error", "external_credentials_unavailable", 503)
             key_label = ch.label if len(channels) > 1 else pname
             load_key = f"mc:{pname}|{key_label}"
+            if gate_opened is None:
+                # 门关（或本轮未走到门）：与升级前逐字节一致
+                gate_opened = _UpstreamOpen(
+                    status=200,
+                    resp=minicode.MiniCodeStreamWrap(r, model),
+                    client=client)
+            # 判健康时 gate_opened 已带 prefetched（peek 预读
+            # 字节，客户端一个都不丢）+ peek_iter（httpx 流
+            # 只能完整迭代一次，续读必须复用同一生成器）
             return Response(
-                _stream_body(_UpstreamOpen(status=200,
-                                           resp=minicode.MiniCodeStreamWrap(r, model),
-                                           client=client),
-                             model, key_label, started, None, client_key_label,
-                             load_key=load_key),
+                _stream_body(gate_opened, model, key_label, started, None,
+                             client_key_label, load_key=load_key,
+                             prefetched=gate_prefetched),
                 content_type="text/event-stream")
         except Exception as e:
             client.close()
@@ -2010,12 +2109,17 @@ def _forward_external(data: dict, model: str, prov: dict):
             def _open_stream():
                 """开闸：建连 + 状态码判定 + 换 key/账号重试，全程未向客户端吐字节。
 
-                返回 (resp, key_label, client)，client 的生命周期交由吐流阶段收尾；
-                凭证全部不可用（签名失败 / 每个 key 都被拒）返回 None。
+                返回 (resp, key_label, client, gate_opened, gate_prefetched)：
+                client 的生命周期交由吐流阶段收尾；gate_opened 非 None =
+                嗅探门已判健康（带 prefetched 预读字节与 peek_iter 续读
+                生成器）；凭证全部不可用（签名失败 / 每个 key 都被拒 /
+                全部被嗅探门判负）返回 None。
                 """
                 client = httpx.Client()
                 tried = set()
                 key_label = pname
+                gate_opened = None
+                gate_prefetched = None
                 try:
                     for attempt in range(attempts):
                         if is_ac:
@@ -2046,7 +2150,37 @@ def _forward_external(data: dict, model: str, prov: dict):
                         # 200 / 换号无益的状态 / 已是最后一次尝试 → 交给上层定夺
                         if r.status_code == 200 or r.status_code not in retryable \
                                 or attempt == attempts - 1:
-                            return r, key_label, client
+                            if r.status_code == 200 and _feature_stream_gate():
+                                # 流内嗅探门（T3 / 方案 v2 §3.2）：上游
+                                # 可能 200 后在流内报错/空流。peek 在
+                                # 换 key 循环内同步执行，判负还能换
+                                # 下一个 key。判负红线：与主池一致——
+                                # 只耗 attempt 预算换 key，绝不触发
+                                # 任何冷却（provider 级
+                                # _prov_quota_cooldown 也不动——误判
+                                # 慢 key 不能被冷却）；_peek_stream
+                                # 判负时已关闭 gate_opened（→r）。
+                                gate_opened = _UpstreamOpen(status=200, resp=r)
+                                verdict, gate_prefetched, reason = _peek_stream(
+                                    gate_opened, model=model, uid=key_label)
+                                if verdict == "bad":
+                                    activity.add(
+                                        "warn",
+                                        f"{model} · {key_label} 流内嗅探判负"
+                                        f"（{reason}），换 key",
+                                        model=model, user_id=key_label,
+                                        status="gate")
+                                    gate_opened = None
+                                    gate_prefetched = None
+                                    r = None
+                                    continue
+                                # 判健康：client 生命周期归
+                                # _stream_body 的 finally 收尾
+                                # （与无门时一致）
+                                gate_opened.client = client
+                                return (r, key_label, client,
+                                        gate_opened, gate_prefetched)
+                            return r, key_label, client, None, None
                         err_body = r.read()[:400].decode("utf-8", errors="replace")
                         log.warning("[%s] key %s 流式连接返回 %s，换下一个 key: %s",
                                     pname, key_label, r.status_code, err_body[:200])
@@ -2062,7 +2196,7 @@ def _forward_external(data: dict, model: str, prov: dict):
                 return _openai_error(
                     f"no usable credential for provider '{pname}'",
                     "proxy_upstream_error", "external_credentials_unavailable", 503)
-            r, key_label, client = result
+            r, key_label, client, gate_opened, gate_prefetched = result
             status = r.status_code
             if status != 200:
                 # 一个字节都还没吐给客户端：状态码改得动，如实回真实码
@@ -2088,10 +2222,16 @@ def _forward_external(data: dict, model: str, prov: dict):
             # 负载键加前缀隔离命名空间：与 pick_key/pick_channel 的 load_of 查询键一致
             _prov_quota_cooldown.pop(pname, None)   # 0929：任何 key 成功即解除冷却
             load_key = f"key:{pname}|{key_label}" if not is_ac else f"ac:{pname}|{key_label}"
+            if gate_opened is None:
+                # 门关（或本轮未走到门）：与升级前逐字节一致
+                gate_opened = _UpstreamOpen(status=200, resp=r, client=client)
+            # 判健康时 gate_opened 已带 prefetched（peek 预读
+            # 字节，客户端一个都不丢）+ peek_iter（httpx 流
+            # 只能完整迭代一次，续读必须复用同一生成器）
             return Response(
-                _stream_body(_UpstreamOpen(status=200, resp=r, client=client),
-                             model, key_label, started, None, client_key_label,
-                             load_key=load_key),
+                _stream_body(gate_opened, model, key_label, started, None,
+                             client_key_label, load_key=load_key,
+                             prefetched=gate_prefetched),
                 content_type="text/event-stream")
 
         # 非流式：key 池/账号池逐个尝试（401/402/403/429 换下一个）

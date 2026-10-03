@@ -73,6 +73,21 @@ log = logging.getLogger("qidi-relay")
 bp = Blueprint("admin", __name__, url_prefix="/api")
 
 
+# ─── 免费通道串行门（排队语义，方案 v2 §3.2）─────────────────────────
+
+@bp.route("/gate")
+@check_admin_auth
+def api_gate():
+    """免费通道串行门状态：busy=有请求在途（已发起、响应头未到），
+    waiting=正在门内排队等待的请求数（等待不计账号失败/冷却，
+    契约见 proxy_core.cline.wait_for_slot）。"""
+    with cline._gate_cv:
+        return jsonify({"free_channel": {
+            "busy": cline._gate_busy,
+            "waiting": cline._gate_waiters,
+        }})
+
+
 # ─── 账号管理 ────────────────────────────────────────────────────────────────
 
 @bp.route("/atomcode/status")

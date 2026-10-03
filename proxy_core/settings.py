@@ -24,15 +24,77 @@ DEFAULT_VISION_CAPABLE_MODELS = {"codely-vl"}
 DEFAULT_VISION_MODEL = "codely-vl"
 
 
+# 重复键检查（F 小修）：json 的 dict 语义会静默丢弃重复键
+# （后者覆盖前者）。config.json 曾因此出现 pricing 节
+# "deepseek-v4-flash" 与 "DeepSeek-V4-Flash" 双键并存——
+# 计费/路由按大小写敏感键取值，静默覆盖等于配置漂移。
+# 用 object_pairs_hook 在解析时收集"大小写折叠后重复"的
+# 键路径并告警（只告警，解析行为不变）。
+CONFIG_DUPLICATE_KEY_WARNINGS: list = []
+_MAX_DUP_KEY_WARNINGS = 20   # 告警上限：防坏配置灌爆日志/面板
+
+
+class _DupKeyNode(dict):
+    """object_pairs_hook 产物：除 json 语义的 dict 外，额外
+    记住本层全部键值对（含被覆盖的重复键），供事后按路径
+    收集重复键。是 dict 的子类——对 load_config 的调用方
+    完全透明（.get/[]/items 语义不变）。"""
+
+    def __init__(self, pairs):
+        super().__init__(pairs)   # 与 json.loads 一致：后者覆盖前者
+        self._dup_pairs = pairs
+
+
+def _collect_dup_keys(node, prefix: str, out: list) -> None:
+    """递归收集"大小写折叠后重复"的键路径（去重，超上限即停）。
+
+    数组内的对象以 "键[]" 记路径（配置里数组元素几乎不
+    重复，仅防御性覆盖）。
+    """
+    if len(out) >= _MAX_DUP_KEY_WARNINGS:
+        return
+    folded: dict = {}
+    for k, _v in node._dup_pairs:
+        if not isinstance(k, str):
+            continue
+        f = k.casefold()
+        if f in folded:
+            path = f"{prefix}{folded[f]} 与 {prefix}{k} 大小写折叠后重复"
+            if path not in out:
+                out.append(path)
+            if len(out) >= _MAX_DUP_KEY_WARNINGS:
+                return
+        else:
+            folded[f] = k
+    for k, v in node._dup_pairs:
+        if isinstance(v, _DupKeyNode):
+            _collect_dup_keys(v, f"{prefix}{k}.", out)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, _DupKeyNode):
+                    _collect_dup_keys(item, f"{prefix}{k}[].", out)
+        if len(out) >= _MAX_DUP_KEY_WARNINGS:
+            return
+
+
 def load_config() -> dict:
-    """加载管理员配置，文件缺失或损坏时返回安全默认值。"""
+    """加载管理员配置，文件缺失或损坏时返回安全默认值。
+
+    大小写折叠后重复的键路径收集进 CONFIG_DUPLICATE_KEY_WARNINGS
+    （每次加载前清空；上限 20 条、去重）——解析结果本身不变
+    （重复键仍按 json 语义后者覆盖前者）。
+    """
+    CONFIG_DUPLICATE_KEY_WARNINGS.clear()
     if not CONFIG_FILE.exists():
         return {"admin_password": None, "allowed_ips": ["*"]}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f, object_pairs_hook=_DupKeyNode)
     except Exception:
         return {"admin_password": None, "allowed_ips": ["*"]}
+    if isinstance(cfg, _DupKeyNode):
+        _collect_dup_keys(cfg, "", CONFIG_DUPLICATE_KEY_WARNINGS)
+    return cfg
 
 
 def save_config(cfg: dict) -> None:

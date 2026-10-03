@@ -444,6 +444,7 @@ def pick_channel(name: str, exclude: set = None) -> ClineChannel | None:
 _gate_cv = threading.Condition()
 _gate_busy = False          # 有请求"已发起、响应头未到"
 _gate_last_done_ts = 0.0    # 上一次响应头到达的时刻
+_gate_waiters = 0           # 正在门内排队等待的请求数（/api/gate 面板用）
 
 
 def wait_for_slot(model: str) -> None:
@@ -451,21 +452,39 @@ def wait_for_slot(model: str) -> None:
 
     检查与占位（_gate_busy=True）在条件变量锁内完成，无竞态；
     等待期间锁自动释放，不阻塞 mark_slot_done。
+
+    排队语义契约（方案 v2 §3.2，0924 审计 L-3 语义固化）：
+    等待不计账号失败、不触发任何冷却——请求尚在本地门内
+    排队时还没有向上游发起任何请求，上游侧的一切判负/
+    冷却都与排队中的请求无关。
     """
-    global _gate_busy
+    global _gate_busy, _gate_waiters
     if not is_free_model(model):
         return
     with _gate_cv:
-        while True:
-            if _gate_busy:
-                _gate_cv.wait(timeout=5.0)      # 等在途请求拿到响应头
-                continue
-            wait = _gate_last_done_ts + MIN_REQUEST_GAP_S - time.time()
-            if wait > 0:
-                _gate_cv.wait(wait)            # 等最小间隔
-                continue
-            _gate_busy = True
-            return
+        waiting = False      # 本请求是否已进入排队计数
+        try:
+            while True:
+                if _gate_busy:
+                    if not waiting:
+                        waiting = True
+                        _gate_waiters += 1     # 等待中 +1（锁内）
+                    _gate_cv.wait(timeout=5.0)      # 等在途请求拿到响应头
+                    continue
+                wait = _gate_last_done_ts + MIN_REQUEST_GAP_S - time.time()
+                if wait > 0:
+                    if not waiting:
+                        waiting = True
+                        _gate_waiters += 1     # 间隔排队同样计入等待
+                    _gate_cv.wait(wait)            # 等最小间隔
+                    continue
+                _gate_busy = True
+                return                      # 拿到位：finally 内 -1
+        finally:
+            # 拿到位（return）/ 超时退出（未来扩展）：
+            # 仍在排队计数中则 -1（锁内）
+            if waiting:
+                _gate_waiters -= 1
 
 
 def mark_slot_done(model: str) -> None:

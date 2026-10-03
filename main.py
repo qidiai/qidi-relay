@@ -14,7 +14,8 @@ import queue
 
 from flask import Flask, render_template
 
-from proxy_core.settings import LOG_FILE, VERSION, get_port
+from proxy_core import settings
+from proxy_core.settings import LOG_FILE, VERSION, get_port, load_config
 from proxy_core.state import am  # noqa: F401  (导入即初始化单例)
 from routes.admin import bp as admin_bp
 from routes.proxy import bp as proxy_bp
@@ -66,6 +67,12 @@ def knowledge():
 
 if __name__ == "__main__":
     port = get_port()
+    # F 小修：config.json 重复键（大小写折叠后重复，解析时
+    # 后者覆盖前者）启动时逐条 error 点名（收集逻辑见
+    # proxy_core.settings.load_config）
+    load_config()
+    for _warn in settings.CONFIG_DUPLICATE_KEY_WARNINGS:
+        log.error("config.json 重复键: %s", _warn)
     log.info("=" * 50)
     log.info("QiDi Relay v%s 启动中...", VERSION)
     log.info("端口: %d", port)
