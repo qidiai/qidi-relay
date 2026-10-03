@@ -10,7 +10,15 @@
 """
 
 import pathlib
+import sys
 import tempfile
+
+# 跨目录修复（任务 0）：从其他目录跑
+# pytest <绝对路径>/tests 时 CWD 不是仓库根，
+# 必须先把仓库根塞进 sys.path 再 import，
+# 否则 import proxy_core.settings 直接
+# ModuleNotFoundError。
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import proxy_core.settings as S
 

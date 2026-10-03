@@ -1,8 +1,11 @@
 """常量与配置加载。"""
 
 import json
+import logging
 import os
 from pathlib import Path
+
+log = logging.getLogger("qidi-relay")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -154,13 +157,66 @@ def get_thinking_models() -> list:
     return list(DEFAULT_THINKING_MODELS)
 
 
+def _parse_budget(item: dict, daily_limit: int | None) -> dict | None:
+    """解析每 key 预算限额块（阶段 C / 方案 §5.1）。
+
+    返回 None = 未配置限额。limit.tokens 优先于旧
+    daily_token_limit；无 limit 块但有 daily_token_limit
+    时按迁移语义视为 {"period": "day", "tokens":
+    daily_token_limit}——旧配置零改动即获得 day 窗
+    预算限额。
+    """
+    raw = item.get("limit")
+    if raw is None:
+        if daily_limit is None:
+            return None
+        # 迁移语义：只写了旧 daily_token_limit 时视为
+        # day 窗 tokens 限额（limit 块缺省）。
+        return {"period": "day", "tokens": daily_limit,
+                "cost": None, "cache_reads": False}
+    if not isinstance(raw, dict):
+        log.warning("api_keys 条目的 limit 块应为对象，忽略该限额配置")
+        return None
+    period = str(raw.get("period") or "day")
+    if period != "day":
+        # v1 只实现 day 窗：其他 period 值告警并按 day 处理（方案 §5.1）。
+        log.warning("api key 预算 limit.period=%s 暂不支持（v1 仅 day），按 day 处理",
+                    period)
+    tokens = raw.get("tokens")
+    try:
+        tokens = int(tokens) if tokens is not None else None
+    except (TypeError, ValueError):
+        tokens = None
+    cost = raw.get("cost")
+    try:
+        cost = float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost = None
+    return {"period": "day", "tokens": tokens, "cost": cost,
+            "cache_reads": bool(raw.get("cache_reads", False))}
+
+
 def _parse_api_keys(raw) -> dict:
-    """归一化 api_keys 配置 -> {key: label}。
+    """归一化 api_keys 配置 -> {key: {label, limit, budget}}。
 
     支持两种格式（可混用）：
     - 简单字符串列表：["sk-aaa", "sk-bbb"]（label = key 前缀）
-    - 对象列表：[{"key": "sk-aaa", "label": "张三", "daily_token_limit": 200000}]
-      label 缺省用 key 前缀；daily_token_limit 为可选的每 key 日 token 限额。
+    - 对象列表：[{"key": "sk-aaa", "label": "张三",
+                  "daily_token_limit": 200000,
+                  "limit": {"period": "day", "tokens": 2000000,
+                            "cost": 5.0, "cache_reads": false}}]
+      label 缺省用 key 前缀；daily_token_limit 为可选的每 key
+      日 token 限额（旧字段）；limit 块为客户端预算限额
+      （阶段 C / 方案 §5.1，优先于旧字段）。
+
+    budget 语义（方案 §5.1）：
+    - limit.tokens 优先——与 daily_token_limit 并存时旧字段
+      不参与阈值判定（预算检查兜住同一阈值）；
+    - 无 limit 块但有 daily_token_limit → 迁移为
+      {"period": "day", "tokens": daily_token_limit}；
+    - 返回的 "limit" 字段 = 生效的日 token 阈值
+      （limit.tokens 优先），既有 daily_token_limit_exceeded
+      检查与预算检查共用同一阈值。
     """
     out = {}
     if not isinstance(raw, list):
@@ -169,7 +225,8 @@ def _parse_api_keys(raw) -> dict:
         if isinstance(item, str):
             k = item.strip()
             if k:
-                out[k] = {"label": k[:12] + "…" if len(k) > 12 else k, "limit": None}
+                out[k] = {"label": k[:12] + "…" if len(k) > 12 else k,
+                          "limit": None, "budget": None}
         elif isinstance(item, dict):
             k = str(item.get("key") or "").strip()
             if not k:
@@ -180,18 +237,26 @@ def _parse_api_keys(raw) -> dict:
                 limit = int(limit) if limit is not None else None
             except (TypeError, ValueError):
                 limit = None
-            out[k] = {"label": label, "limit": limit}
+            budget = _parse_budget(item, limit)
+            # limit.tokens 优先：limit 块生效时旧字段不参与
+            # 阈值判定（新机制预算检查兜住同一阈值）。
+            effective = (budget.get("tokens")
+                         if budget is not None and budget.get("tokens") is not None
+                         else limit)
+            out[k] = {"label": label, "limit": effective, "budget": budget}
     return out
 
 
 def get_api_keys() -> dict:
-    """需要鉴权的 API Key 表 {key: {label, limit}}；空 = 不鉴权（纯局域网模式向后兼容）。"""
+    """需要鉴权的 API Key 表 {key: {label, limit, budget}}；空 = 不鉴权（纯局域网模式向后兼容）。"""
     return _parse_api_keys(load_config().get("api_keys", []))
 
 
 def get_api_key_entries() -> list:
     """API key 明细（管理面板展示用；含 key 前缀脱敏，不含完整 key）。"""
     return [
-        {"label": v["label"], "limit": v["limit"], "key_preview": k[:8] + "…" + k[-4:] if len(k) > 14 else k}
+        {"label": v["label"], "limit": v["limit"],
+         "budget": v.get("budget"),
+         "key_preview": k[:8] + "…" + k[-4:] if len(k) > 14 else k}
         for k, v in get_api_keys().items()
     ]

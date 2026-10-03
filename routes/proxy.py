@@ -24,6 +24,7 @@ from proxy_core import cline
 from proxy_core import minicode
 from proxy_core import anthropic
 from proxy_core import affinity
+from proxy_core import budget
 from proxy_core.accounts import AUTH_COOLDOWN_S, QUOTA_COOLDOWN_S
 from proxy_core.atomcode import channels_for, pick_channel
 from proxy_core.keystore import build_litellm_headers, session_pool
@@ -59,12 +60,87 @@ def _record_key_usage(model: str, usage: dict):
         token_stats.record_key(label, model, usage)
 
 
+def _budget_reserve(key_id: str, path: str):
+    """客户端预算预留（阶段 C / 方案 §5.3）。
+
+    仅在产生 usage 的端点（budget.USAGE_PATHS 常量）上预留；
+    /v1/models、/v1/messages/count_tokens、/codely/models 等
+    不产生用量的端点豁免。est 按端点归一（budget.
+    estimate_tokens_for：chat 取 messages、responses/
+    embeddings 取 input、/v1/messages 另计顶层 system/
+    tools；统一 chars/2.5，不另起公式）；请求体由 Flask
+    缓存，视图内再次解析零开销。
+    """
+    if not _feature_budget():
+        return None, None
+    if path not in budget.USAGE_PATHS:
+        return None, None
+    if (request.content_length or 0) > ANTHROPIC_MAX_BODY_BYTES:
+        # 413 先拒后读（R4）：超 /v1/messages 视图 32MiB
+        # 上限（ANTHROPIC_MAX_BODY_BYTES）的包，在整包
+        # get_json 解析前预检 content_length 并跳过
+        # reserve，让视图自己的 413 语义生效。选"跳过
+        # reserve"而非直接回 413：/v1/chat/completions
+        # 等入口没有视图 cap，直接回 413 会改其既有
+        # 行为；chunked 无长度头时 content_length 为
+        # None，按视图口径照常处理。
+        return None, None
+    data = request.get_json(silent=True) or {}
+    est = budget.estimate_tokens_for(path, data)
+    return budget.reserve(key_id, est, model=data.get("model"))
+
+
+def _budget_refusal_response(refusal: dict):
+    """预算超限 429（方案 §5.3）：/v1/messages 用 Anthropic
+    错误形（anthropic.error_payload），其余端点用 OpenAI
+    错误形（_openai_error）；消息点名 key 名/已用/上限/
+    重置时间（本地时区），Retry-After = 距午夜秒数。
+    """
+    label = refusal["label"]
+    reset_at = refusal["reset_at"]
+    if refusal["reason"] == "cost":
+        used = f"{refusal['used_cost']:.2f}"
+        limit = f"{refusal['limit_cost']:.2f}"
+        unit = "元"
+    else:
+        used = str(refusal["used_tokens"])
+        limit = str(refusal["limit_tokens"])
+        unit = "tokens"
+    message = (f"Budget limit exceeded for API key {label}: "
+               f"used {used} of {limit} {unit}, "
+               f"resets at {reset_at} (local time)")
+    log.warning("API key %s 预算超限（%s 已用 %s/%s %s），拒绝请求",
+                label, refusal["reason"], used, limit, unit)
+    if request.path == "/v1/messages":
+        resp = jsonify(anthropic.error_payload(message,
+                                               "rate_limit_error"))
+    else:
+        resp = _openai_error(message, "rate_limit_error",
+                             "budget_limit_exceeded", status=429)
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(int(refusal["retry_after"]))
+    return resp
+
+
+def _g_budget_release():
+    """当前请求的预算释放 handle（阶段 C / 方案 §5.3）。
+
+    流式转发各通道（主池/cline/minicode/外部）在请求上下文
+    内捕获 handle——_stream_body 生成器在请求上下文之外
+    运行，flask.g 不可达（与 key_label 同款传递模式）。
+    """
+    return (getattr(g, "budget_release", None)
+            if has_request_context() else None)
+
+
 def require_api_key(f):
     """公网部署时校验客户端 API Key（config.json 的 "api_keys"，空列表 = 不鉴权）。
 
     兼容两种传递方式：Authorization: Bearer <key> 与 x-api-key: <key>。
     校验通过后把 key 标签挂到 flask.g.api_key_label（供按 key 记账），
-    并检查该 key 的日 token 限额（超限返回 429）。
+    并检查该 key 的日 token 限额（超限返回 429）；阶段 C（方案 §5）
+    起在产生 usage 的端点上追加客户端预算限额（day 窗）预留
+    （超限返回 429，release 时序见 _budget_reserve 注释）。
     """
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -81,7 +157,19 @@ def require_api_key(f):
                 if hmac_mod.compare_digest(supplied, k):
                     g.api_key_label = meta["label"]
                     limit = meta.get("limit")
-                    if limit and token_stats.key_exceeded(meta["label"], limit):
+                    # 旧日限额检查：仅作 features.budget=False
+                    # 时的兜底（R3）。预算机制生效时整体跳过
+                    # ——预算判负条件 used+在途>=limit 至少与
+                    # 旧检查 used>=limit 一样早触发，且口径
+                    # 含在途份额，严格覆盖旧检查。豁免面与
+                    # 预算机制对齐：只挂在 budget.USAGE_PATHS
+                    # 上——/v1/models、/v1/messages/
+                    # count_tokens 等不产生用量的端点不因
+                    # 旧检查 429（与新机制一致）。
+                    if (limit
+                            and request.path in budget.USAGE_PATHS
+                            and not _feature_budget()
+                            and token_stats.key_exceeded(meta["label"], limit)):
                         log.warning("API key %s 今日用量已达限额 %d，拒绝请求", meta["label"], limit)
                         return jsonify({
                             "error": {
@@ -91,7 +179,29 @@ def require_api_key(f):
                                 "code": "daily_token_limit_exceeded",
                             }
                         }), 429
-                    return f(*args, **kwargs)
+                    # 客户端预算限额（阶段 C / 方案 §5.3）：新机制优先。
+                    # 预算生效时旧检查已被上方门控跳过（兜底
+                    # 语义见上）；此处 reserve 判负 → 429
+                    # 预算形状（_budget_refusal_response）。
+                    release, refusal = _budget_reserve(k, request.path)
+                    if refusal is not None:
+                        return _budget_refusal_response(refusal)
+                    if release is not None:
+                        g.budget_release = release
+                    try:
+                        resp = f(*args, **kwargs)
+                    except Exception:
+                        # 视图异常（流式尚未启动）→ 立即释放预留
+                        if release is not None:
+                            release()
+                        raise
+                    if release is not None and not getattr(resp, "is_streamed", False):
+                        # 非流式：视图已产出完整响应 → 立即释放预留。
+                        # 流式响应体生成器在请求上下文之外运行
+                        #（flask.g 不可达），由 _stream_body 的
+                        # finally 释放（含客户端断开的 GeneratorExit）。
+                        release()
+                    return resp
         return jsonify({
             "error": {
                 "message": "Invalid API key. Set Authorization: Bearer <key> or x-api-key header.",
@@ -398,6 +508,19 @@ def _feature_affinity() -> bool:
             if isinstance(feats, dict) else True)
 
 
+def _feature_budget() -> bool:
+    """客户端预算限额开关（features.budget，键缺省视为开启，
+    与 stream_gate/affinity 同风格）。
+
+    每请求现读 config——与 _feature_stream_gate 同风格，
+    改 config.json 不必重启即生效。features 非 dict 时安全
+    回落缺省值（防御式取值，与门内容判定同纪律）。
+    """
+    feats = load_config().get("features")
+    return (feats.get("budget", True)
+            if isinstance(feats, dict) else True)
+
+
 # 嗅探门内容判定的字段集（OpenAI 形流式帧，防御式逐字段取）
 _GATE_CONTENT_FIELDS = ("content", "refusal", "reasoning_content",
                         "reasoning", "tool_calls", "function_call")
@@ -573,7 +696,8 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                  sess=None, key_label: str | None = None,
                  load_key: str | None = None, prefetched=None,
                  session_key: str | None = None,
-                 turn_boundary: bool | None = None):
+                 turn_boundary: bool | None = None,
+                 budget_release=None):
     """把已确认 200 的上游流吐给客户端，边吐边提取 usage 与上游实际模型名。
 
     首字节已出 → HTTP 状态码改不了，中途失败只能用 in-band SSE 错误事件收尾。
@@ -583,6 +707,10 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     一个字节不丢），再续读同一上游流；为 None 时行为与无门时逐字节一致。
     session_key/turn_boundary = 会话粘性（阶段 B / 方案 §4，v1 仅主池）：
     usage 记账后调 affinity.record 更新内存表；外部通道不传（不记录）。
+    budget_release = 客户端预算（阶段 C / 方案 §5.3）预留的释放
+    handle：本生成器在请求上下文之外运行（flask.g 不可达），
+    由调用方在请求上下文内捕获传入；finally 中释放——完成、
+    中断、客户端断开（GeneratorExit）都释放。
     """
     usage_captured = None
     line_buf = ""
@@ -654,6 +782,10 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
         opened.close()
         if sess is not None:
             session_pool.release(sess)
+        if budget_release is not None:
+            # 客户端预算（阶段 C / 方案 §5.3）：流式响应完成、
+            # 中断或客户端断开（GeneratorExit）都释放预留。
+            budget_release()
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     if usage_captured:
@@ -1068,12 +1200,14 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                         _stream_body(opened, model, uid, started, sess,
                                      key_label, prefetched=prefetched,
                                      session_key=affinity_skey,
-                                     turn_boundary=affinity_turn),
+                                     turn_boundary=affinity_turn,
+                                     budget_release=_g_budget_release()),
                         content_type="text/event-stream")
                 return Response(_stream_body(opened, model, uid, started,
                                              sess, key_label,
                                              session_key=affinity_skey,
-                                             turn_boundary=affinity_turn),
+                                             turn_boundary=affinity_turn,
+                                             budget_release=_g_budget_release()),
                                 content_type="text/event-stream")
             session_pool.release(sess)
             last_open, last_uid = opened, uid
@@ -1649,7 +1783,8 @@ def _forward_cline(data: dict, model: str, prov: dict):
             return Response(
                 _stream_body(gate_opened, model, key_label, started, None,
                              client_key_label, load_key=load_key,
-                             prefetched=gate_prefetched),
+                             prefetched=gate_prefetched,
+                             budget_release=_g_budget_release()),
                 content_type="text/event-stream")
         except Exception as e:
             client.close()
@@ -1980,7 +2115,8 @@ def _forward_minicode(data: dict, model: str, prov: dict):
             return Response(
                 _stream_body(gate_opened, model, key_label, started, None,
                              client_key_label, load_key=load_key,
-                             prefetched=gate_prefetched),
+                             prefetched=gate_prefetched,
+                             budget_release=_g_budget_release()),
                 content_type="text/event-stream")
         except Exception as e:
             client.close()
@@ -2304,7 +2440,8 @@ def _forward_external(data: dict, model: str, prov: dict):
             return Response(
                 _stream_body(gate_opened, model, key_label, started, None,
                              client_key_label, load_key=load_key,
-                             prefetched=gate_prefetched),
+                             prefetched=gate_prefetched,
+                             budget_release=_g_budget_release()),
                 content_type="text/event-stream")
 
         # 非流式：key 池/账号池逐个尝试（401/402/403/429 换下一个）
@@ -2678,6 +2815,10 @@ def v1_responses():
                         for ev in bridge.feed_line(payload):
                             yield ev
             finally:
+                try:
+                    inner.close()
+                except Exception:
+                    pass
                 for ev in bridge.finish():
                     yield ev
             yield "data: [DONE]\n\n"
@@ -2827,21 +2968,31 @@ def v1_anthropic_messages():
             yield bridge.start()
             buf, done = "", False
             try:
+                # 消费至 EOF（R1）：[DONE] 只跳过其后剩余
+                # 的 data 行，外层 for 续读到流尾——对齐
+                # /v1/responses 桥（上方 gen()）。内层
+                # _stream_body 生成器必须跑到自然结束
+                # （StopIteration）才会执行其成功路径记账
+                # 段（token_stats.record/record_key/粘性/
+                # 知识库/注水检测，proxy.py:791 起）；
+                # 此处若在 [DONE] 处 break 外层循环，
+                # _stream_body 挂起点会收到 finally 中
+                # inner.close() 触发的 GeneratorExit，
+                # 记账段整段跳过（Claude Code 主路径
+                # key_stats 恒 0、预算 used 恒 0）。
                 for piece in inner.response:
                     buf += piece.decode("utf-8", errors="replace")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         line = line.strip()
-                        if not line.startswith("data:"):
+                        if not line.startswith("data:") or done:
                             continue
                         payload = line[5:].strip()
                         if payload == "[DONE]":
                             done = True
-                            break
+                            continue
                         for ev in bridge.feed_payload(payload):
                             yield ev
-                    if done:
-                        break
             finally:
                 try:
                     inner.close()

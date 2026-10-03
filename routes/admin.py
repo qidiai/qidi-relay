@@ -776,19 +776,27 @@ def api_providers_info():
 @check_admin_auth
 def api_keys_info():
     """API key 明细 + 今日用量（按 key 记账，供共享/限额面板）。"""
+    from proxy_core import budget as budget_mod
     from proxy_core.settings import get_api_key_entries
     usage = {e["label"]: e for e in token_stats.get_key_stats()}
     out = []
     for e in get_api_key_entries():
         u = usage.get(e["label"], {})
-        out.append({
+        row = {
             "label": e["label"],
             "key_preview": e["key_preview"],
             "daily_token_limit": e["limit"],
             "today_tokens": u.get("total_tokens", 0),
             "today_requests": u.get("requests", 0),
             "today_models": u.get("models", {}),
-        })
+        }
+        cfg = e.get("budget")
+        if cfg:
+            # 客户端预算（阶段 C / 方案 §5.4）：配置了
+            # limit 块的 key 才曝光预算快照（无 limit
+            # 的 key 不加 budget 键）。
+            row["budget"] = budget_mod.snapshot(e["label"], cfg)
+        out.append(row)
     out.sort(key=lambda x: x["today_tokens"], reverse=True)
     return jsonify({"keys": out})
 

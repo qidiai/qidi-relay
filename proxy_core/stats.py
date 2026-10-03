@@ -23,6 +23,31 @@ def _blank_entry():
     return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests": 0}
 
 
+def _cache_read_tokens(usage: dict) -> int:
+    """从上游 usage 字典提取缓存读 token 数（多协议兼容：
+    OpenAI prompt_tokens_details.cached_tokens /
+    Anthropic cache_read_input_tokens）。
+
+    双字段并存时取 max() 而非求和（R5）：两字段是
+    同一批缓存读 token 的两种协议表达，求和会把
+    同一批重复计（上游不会同时用两字段报两批
+    不同的缓存读）。"""
+    if not isinstance(usage, dict):
+        return 0
+    parts = []
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        try:
+            parts.append(int(details.get("cached_tokens", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+    try:
+        parts.append(int(usage.get("cache_read_input_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        pass
+    return max(parts) if parts else 0
+
+
 class TokenStats:
     """统计各账号、各模型的 token 用量，持久化到 token_stats.json。"""
 
@@ -63,14 +88,22 @@ class TokenStats:
         today = datetime.now().strftime("%Y-%m-%d")
         for label, e in list(self.key_stats.items()):
             if e.get("date") != today:
-                # 保留最近 7 天的 key 历史，便于看趋势；更早的丢弃
+                # 实际行为：旧日期条目立即清零为当日空条目
+                # （不留历史——"保留 7 天"是注释漂移，代码
+                # 从未实现过历史保留；R5 如实改正）
                 self.key_stats[label] = self._blank_key_entry(today)
 
     def _blank_key_entry(self, date: str) -> dict:
-        return {"date": date, "total_tokens": 0, "requests": 0, "models": {}}
+        return {"date": date, "total_tokens": 0, "requests": 0,
+                "models": {}, "cache_tokens": 0}
 
     def record_key(self, label: str, model: str, usage: dict):
-        """按 API key 标签记录一次请求用量（跨天自动清零）。"""
+        """按 API key 标签记录一次请求用量（跨天自动清零）。
+
+        cache_tokens 单独累计（客户端预算 cache_reads=false
+        时不计入预算；total_tokens 口径不变——旧限额检查与
+        面板展示不受影响）。
+        """
         if not usage or not label:
             return
         with self._lock:
@@ -83,6 +116,8 @@ class TokenStats:
             e["requests"] += 1
             m = e["models"].get(model, 0)
             e["models"][model] = m + usage.get("total_tokens", 0)
+            e["cache_tokens"] = (e.get("cache_tokens", 0)
+                                  + _cache_read_tokens(usage))
             self._save()
 
     def key_exceeded(self, label: str, limit: int) -> bool:
@@ -104,6 +139,7 @@ class TokenStats:
                     "total_tokens": e.get("total_tokens", 0),
                     "requests": e.get("requests", 0),
                     "models": dict(e.get("models", {})),
+                    "cache_tokens": e.get("cache_tokens", 0),
                 })
             out.sort(key=lambda x: x["total_tokens"], reverse=True)
             return out
