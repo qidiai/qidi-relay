@@ -88,4 +88,12 @@ if __name__ == "__main__":
         start_background()
     except Exception as e:
         log.warning("种子卫兵启动失败（不影响代理服务）: %s", e)
+    # 语料采集（阶段 E / 方案 §7）：默认关闭（config
+    # corpus.enabled=true 显式开启），后台 worker 线程
+    # 负责脱敏+落盘（§7.3 红线：请求线程只入队）
+    try:
+        from proxy_core.corpus import start_worker
+        start_worker()
+    except Exception as e:
+        log.warning("语料采集启动失败（不影响代理服务）: %s", e)
     app.run(host="0.0.0.0", port=port, debug=False)

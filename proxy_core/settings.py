@@ -21,6 +21,13 @@ LOG_FILE = BASE_DIR / "proxy.log"
 # seedguard 式 BASE_DIR 兜底直写仓库数据文件）。
 CONVERSATIONS_FILE = BASE_DIR / "conversations.json"
 
+# 语料采集（阶段 E / 方案 §7）：本地语料落盘目录
+# （local_YYYYMM.jsonl 与云端 corpus_pull 拉取的
+# corpus_YYYYMM.jsonl 按文件名隔离——§7.2 分名设计
+# 经审计 PASS）。路径常量可注入（测试重定向到
+# TMP——与 CONVERSATIONS_FILE 同纪律）。
+CORPUS_DIR = BASE_DIR / "corpus_local"
+
 LITELLM_API_BASE = "https://codely-litellm.tuanjie.cn"
 CLI_API_KEY_FETCH_URL = "https://codely.tuanjie.cn/api/api-token/cli-api-key"
 

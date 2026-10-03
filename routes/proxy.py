@@ -25,6 +25,7 @@ from proxy_core import minicode
 from proxy_core import anthropic
 from proxy_core import affinity
 from proxy_core import budget
+from proxy_core import corpus
 from proxy_core.accounts import AUTH_COOLDOWN_S, QUOTA_COOLDOWN_S
 from proxy_core.atomcode import channels_for, pick_channel
 from proxy_core.keystore import build_litellm_headers, session_pool
@@ -703,7 +704,7 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                  load_key: str | None = None, prefetched=None,
                  session_key: str | None = None,
                  turn_boundary: bool | None = None,
-                 budget_release=None):
+                 budget_release=None, corpus_ctx=None):
     """把已确认 200 的上游流吐给客户端，边吐边提取 usage 与上游实际模型名。
 
     首字节已出 → HTTP 状态码改不了，中途失败只能用 in-band SSE 错误事件收尾。
@@ -717,6 +718,12 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     handle：本生成器在请求上下文之外运行（flask.g 不可达），
     由调用方在请求上下文内捕获传入；finally 中释放——完成、
     中断、客户端断开（GeneratorExit）都释放。
+    corpus_ctx: 语料采集 correlation（阶段 E / 方案 §7.1/7.2，
+    三协议入口捕获后经 _proxy_chat 传入——key_label 同款
+    传递模式）。非 None = 采集开启：建 _StreamTap 累积
+    assistant 输出流，成功收尾（saw_done 且无异常——与
+    下方"成功才记忆"同判据）后组样本入队；None = 采集
+    关闭（零开销：不建 tap、不进采集分支）。
     """
     usage_captured = None
     line_buf = ""
@@ -730,6 +737,9 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     ttft_content_ms = None
     ttft_text_ms = None
     saw_done = False
+    # 语料采集（阶段 E / 方案 §7.1）：开关开启才建
+    # tap——关闭零开销（_consume_chunk 不进采集分支）
+    tap = corpus._StreamTap() if corpus_ctx is not None else None
     rid = registry.register(model, load_key or uid, stream=True)
 
     def _consume_chunk(chunk: bytes) -> None:
@@ -757,38 +767,51 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
             m = _extract_model_from_line(line)
             if m and not model_returned:
                 model_returned = m
-            if ttft_content_ms is None or ttft_text_ms is None:
+            # 显式偏差声明（双审裁决 2026-10-03）：TTFT 被动观测
+            # 不受 features.stream_gate 连坐（关门不损失质量数据），
+            # 旧首字节口径并存，回滚安全。
+            if (tap is not None
+                    or ttft_content_ms is None
+                    or ttft_text_ms is None):
                 # 双口径 TTFT 采集（阶段 D / 方案 §6）：解
                 # data: 帧逐字段判定（字段集与嗅探门
                 # _GATE_CONTENT_FIELDS 同源——共享常量，
                 # 避免两处漂移；行解析口径与门一致，整行
                 # 到达才计）。两口径都集齐后停止解析
-                # （纯开销门）。
+                # （纯开销门——语料 tap 开启时除外：tap
+                # 需逐帧累积）。
                 if line.startswith("data:"):
                     try:
                         obj = json.loads(line[5:].strip())
                     except (ValueError, TypeError):
                         obj = None
                     if isinstance(obj, dict):
-                        for choice in obj.get("choices") or ():
-                            if not isinstance(choice, dict):
-                                continue
-                            delta = choice.get("delta")
-                            if not isinstance(delta, dict):
-                                continue
-                            now_ms = None
-                            for field in _GATE_CONTENT_FIELDS:
-                                if not delta.get(field):
+                        if tap is not None:
+                            # 语料采集（阶段 E / 方案 §7.1）：
+                            # 累积 assistant content/thinking/
+                            # tool_calls 输出流
+                            tap.feed(obj)
+                        if (ttft_content_ms is None
+                                or ttft_text_ms is None):
+                            for choice in obj.get("choices") or ():
+                                if not isinstance(choice, dict):
                                     continue
-                                if now_ms is None:
-                                    now_ms = int(
-                                        (time.perf_counter() - started)
-                                        * 1000)
-                                if ttft_content_ms is None:
-                                    ttft_content_ms = now_ms
-                                if (field in _TTFT_TEXT_FIELDS
-                                        and ttft_text_ms is None):
-                                    ttft_text_ms = now_ms
+                                delta = choice.get("delta")
+                                if not isinstance(delta, dict):
+                                    continue
+                                now_ms = None
+                                for field in _GATE_CONTENT_FIELDS:
+                                    if not delta.get(field):
+                                        continue
+                                    if now_ms is None:
+                                        now_ms = int(
+                                            (time.perf_counter() - started)
+                                            * 1000)
+                                    if ttft_content_ms is None:
+                                        ttft_content_ms = now_ms
+                                    if (field in _TTFT_TEXT_FIELDS
+                                            and ttft_text_ms is None):
+                                        ttft_text_ms = now_ms
 
     try:
         if prefetched is not None:
@@ -862,6 +885,21 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                   ttft_ms=ttft_ms, total_ms=latency_ms,
                   ttft_content_ms=ttft_content_ms,
                   ttft_text_ms=ttft_text_ms)
+    # 语料采集（阶段 E / 方案 §7.2/7.5）：成功收尾
+    # （saw_done 且无异常——与上方 affinity"成功才记忆"
+    # 同判据；except 分支已 return 提前退出，截断流
+    # saw_done=False → partial → 决策表丢弃不产样本）
+    # 才组样本入队（只入队，脱敏在 worker 线程）。
+    if tap is not None:
+        corpus.maybe_collect(
+            corpus_ctx, tap.assistant(),
+            uid=uid, model=model,
+            model_served=model_returned,
+            usage=usage_captured,
+            ttft_content_ms=ttft_content_ms,
+            total_ms=latency_ms, stream=True,
+            partial=not saw_done,
+            body_truncated=tap.truncated)
     activity.add("ok", f"{model} · 账号 {uid}（流式）", model=model, user_id=uid,
                  latency_ms=latency_ms,
                  tokens=(usage_captured or {}).get("total_tokens", 0), status=200)
@@ -963,10 +1001,34 @@ def _pool_exhausted(model: str):
                          "service_unavailable", "no_available_account", 503)
 
 
-def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transform=None):
+def _assistant_from_chat(resp_json: dict) -> dict:
+    """非流式 chat 响应 → 语料样本 assistant 块
+    （阶段 E / 方案 §7.2 schema：content/thinking/
+    tool_calls/finish）。"""
+    choice = (resp_json.get("choices") or [{}])[0]
+    if not isinstance(choice, dict):
+        choice = {}
+    msg = choice.get("message") or {}
+    if not isinstance(msg, dict):
+        msg = {}
+    return {
+        "content": msg.get("content") or "",
+        "thinking": (msg.get("reasoning_content")
+                     or msg.get("reasoning") or ""),
+        "tool_calls": msg.get("tool_calls") or [],
+        "finish": choice.get("finish_reason"),
+    }
+
+
+def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transform=None, corpus_ctx=None):
     """多账号轮询转发 chat 请求的公共逻辑。
 
     transform: 可选，把上游 chat 响应 JSON 转换成其它响应格式（Responses API 用）。
+    corpus_ctx: 语料采集 correlation（阶段 E / 方案 §7.1，
+      三协议入口捕获后经 key_label 同款传递模式传入；
+      None = 采集关闭——零开销）。流式传入 _stream_body
+      （tap 累积 + 成功收尾组样本），非流式在 resp_json
+      处组样本。
     """
     model = data.get("model", "")
     started = time.perf_counter()
@@ -1249,13 +1311,15 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                                      key_label, prefetched=prefetched,
                                      session_key=affinity_skey,
                                      turn_boundary=affinity_turn,
-                                     budget_release=_g_budget_release()),
+                                     budget_release=_g_budget_release(),
+                                     corpus_ctx=corpus_ctx),
                         content_type="text/event-stream")
                 return Response(_stream_body(opened, model, uid, started,
                                              sess, key_label,
                                              session_key=affinity_skey,
                                              turn_boundary=affinity_turn,
-                                             budget_release=_g_budget_release()),
+                                             budget_release=_g_budget_release(),
+                                             corpus_ctx=corpus_ctx),
                                 content_type="text/event-stream")
             session_pool.release(sess)
             last_open, last_uid = opened, uid
@@ -1349,6 +1413,17 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                 # 注水检测：核对上游实际返回的模型名 + 记录性能画像
                 water.observe(uid, model, resp_json.get("model"), usage,
                               ttft_ms=latency_ms, total_ms=latency_ms)
+                # 语料采集（阶段 E / 方案 §7.2）：非流式在
+                # resp_json 处组样本（成功路径——上游 200 且
+                # 非流内错误帧，与流式 saw_done 同判据）
+                if corpus_ctx is not None:
+                    corpus.maybe_collect(
+                        corpus_ctx, _assistant_from_chat(resp_json),
+                        uid=uid, model=model,
+                        model_served=resp_json.get("model", model),
+                        usage=usage, ttft_content_ms=None,
+                        total_ms=latency_ms, stream=False,
+                        partial=False)
                 activity.add("ok", f"{model} · 账号 {uid}",
                              model=model, user_id=uid, latency_ms=latency_ms,
                              tokens=(usage or {}).get("total_tokens", 0), status=200)
@@ -2588,7 +2663,22 @@ def v1_chat():
         debug_path = os.path.join(os.path.dirname(__file__), "..", "last_request.json")
         with open(debug_path, "w", encoding="utf-8") as f:
             _json.dump(data, f, ensure_ascii=False, indent=2)
-    return _proxy_chat(data)
+    # 语料采集（阶段 E / 方案 §7.1）：/v1/chat 的 data
+    # 本身即原文——开关开启才捕获 correlation（关闭
+    # 零开销），经 _proxy_chat 传入 _stream_body
+    # （key_label 同款传递模式）
+    corpus_ctx = corpus.capture_correlation(
+        "openai", data,
+        headers=request.headers,
+        key_label=getattr(g, "api_key_label", None),
+        client=request.remote_addr)
+    # 仅采集开启才透传 corpus_ctx 关键字——
+    # 既有测试/外部通道以单参 stub _proxy_chat
+    # （monkeypatch fake_proxy(data)），关闭时
+    # 调用形状逐字节不变（零回归纪律）
+    corpus_kwargs = ({"corpus_ctx": corpus_ctx}
+                     if corpus_ctx is not None else {})
+    return _proxy_chat(data, **corpus_kwargs)
 
 
 # ===================== Responses API 完整适配层（0906 重写） =====================
@@ -2835,6 +2925,16 @@ class _RespSSE:
 def v1_responses():
     """OpenAI Responses API 完整兼容端点（0906 重写：工具调用 + 流式事件桥接）。"""
     data = request.get_json(force=True, silent=True) or {}
+    # 语料采集（阶段 E / 方案 §7.1）：instructions→
+    # system 转换（_responses_to_chat）前捕获原文
+    # （转换后原始 instructions/input 即丢）
+    corpus_ctx = corpus.capture_correlation(
+        "responses", data,
+        headers=request.headers,
+        key_label=getattr(g, "api_key_label", None),
+        client=request.remote_addr)
+    corpus_kwargs = ({"corpus_ctx": corpus_ctx}
+                     if corpus_ctx is not None else {})
     chat_data = _responses_to_chat(data)
     if not chat_data["messages"]:
         return jsonify({"error": {"message": "Missing 'input' parameter.",
@@ -2842,7 +2942,8 @@ def v1_responses():
                                   "code": "missing_input"}}), 400
     req_model = data.get("model", "")
     if chat_data["stream"]:
-        inner = _flask_response(_proxy_chat(chat_data))
+        inner = _flask_response(
+            _proxy_chat(chat_data, **corpus_kwargs))
         if inner.status_code != 200:
             # 守卫 404 / 池耗尽 503 / 上游失败透传：原样返回结构化错误，
             # 绝不进 SSE 生成器（否则元组被当 Response 用 → 流中途断链）
@@ -2873,7 +2974,8 @@ def v1_responses():
 
         return Response(stream_with_context(gen()), content_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    resp = _flask_response(_proxy_chat(chat_data))
+    resp = _flask_response(
+        _proxy_chat(chat_data, **corpus_kwargs))
     chat_json = resp.get_json(silent=True) or {}
     if "choices" not in chat_json:
         # 透传上游错误（含 404 守卫/429/401 等原样语义）
@@ -3000,13 +3102,24 @@ def v1_anthropic_messages():
     if mapped_model != req_model:
         data["model"] = mapped_model
 
+    # 语料采集（阶段 E / 方案 §7.1）：anthropic_to_chat
+    # 转换前捕获原始 messages+system（转换后原始
+    # 消息即丢）
+    corpus_ctx = corpus.capture_correlation(
+        "anthropic", data,
+        headers=request.headers,
+        key_label=getattr(g, "api_key_label", None),
+        client=request.remote_addr)
+    corpus_kwargs = ({"corpus_ctx": corpus_ctx}
+                     if corpus_ctx is not None else {})
     chat_data = anthropic.anthropic_to_chat(data)
     if not chat_data["messages"]:
         return jsonify(anthropic.error_payload(
             "messages contains no convertible content", "invalid_request_error")), 400
 
     if chat_data["stream"]:
-        inner = _flask_response(_proxy_chat(chat_data))
+        inner = _flask_response(
+            _proxy_chat(chat_data, **corpus_kwargs))
         content_type = (inner.content_type or "").lower()
         if inner.status_code != 200 or "text/event-stream" not in content_type:
             return _anthropic_upstream_error(inner)
@@ -3052,7 +3165,8 @@ def v1_anthropic_messages():
         return Response(stream_with_context(gen()), content_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    resp = _flask_response(_proxy_chat(chat_data))
+    resp = _flask_response(
+        _proxy_chat(chat_data, **corpus_kwargs))
     chat_json = resp.get_json(silent=True) or {}
     if resp.status_code != 200 or "choices" not in chat_json:
         return _anthropic_upstream_error(resp)

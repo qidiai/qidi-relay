@@ -158,7 +158,7 @@ def _drive_stream(chunks, uid, model):
     iter_bytes 续读 + close（无嗅探门 → opened.peek_iter
     不存在 → iter_bytes 路径，与生产无门路径同形）。
     生成器自然消费至 EOF（[DONE]）→ 成功路径记账段
-    （token_stats/kdb/water.observe，proxy.py:790 起）
+    （token_stats/kdb/water.observe，proxy.py:836 起）
     执行。"""
 
     class _FakeResp:

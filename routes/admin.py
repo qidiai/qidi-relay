@@ -830,6 +830,21 @@ def api_stats_quality():
         return jsonify({"error": str(e)[:200]}), 500
 
 
+@bp.route("/corpus/stats")
+@check_admin_auth
+def api_corpus_stats():
+    """语料采集面板数据（阶段 E / 方案 §7.6）：
+    今日/本月条数与 token 量、按 model/role 分布、
+    water_suspect 数、redact_hits 总数、丢弃计数、
+    队列积压。"""
+    try:
+        from proxy_core.corpus import worker as _corpus_worker
+        return jsonify(_corpus_worker.stats())
+    except Exception as e:
+        log.error("语料统计生成失败: %s", e)
+        return jsonify({"error": str(e)[:200]}), 500
+
+
 # 注水检测模型清单缓存：上游 /v1/models 拉一次用 10 分钟，避免管理面板轮询打上游
 _models_cache = {"ts": 0.0, "ids": []}
 _MODELS_TTL = 600

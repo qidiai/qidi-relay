@@ -166,7 +166,7 @@ class WaterCheck:
         dirty = False
         with self._lock:
             if verdict == "mismatch":
-                # 同一目标 10 分钟内只记一次，避免刷屏
+                # 同一目标在最近 10 条被动事件内只记一次，避免刷屏
                 recent = any(p.get("key") == key for p in self.passive[-10:])
                 if not recent:
                     self.passive.append({
@@ -216,6 +216,16 @@ class WaterCheck:
                     dirty = True
             if dirty:
                 self._save()
+
+    def has_passive_suspect(self, uid: str, model: str) -> bool:
+        """只读查询：该 (账号, 模型) 是否有被动嫌疑记录
+        （语料采集 §7.5 water_suspect 判定——被动事件
+        key = f"{uid}|{model_requested}"，见
+        _observe_inner 的 mismatch 分支）。"""
+        key = f"{uid}|{model}"
+        with self._lock:
+            return any(p.get("key") == key
+                       for p in self.passive)
 
     # ─── 主动探针 ───────────────────────────────────────────
     def run_probe(self, model: str, accounts: list, get_key, providers_map=None) -> dict:
@@ -411,14 +421,14 @@ class WaterCheck:
                 for k, v in self.perf.items()
             }
             passive = list(self.passive)
-            probes = self.probes
+            probes = dict(self.probes)
         return quality_aggregate(perf, passive, probes)
 
 
 # ─── 资格评分 v0（方案 §6）─────────────────────────────────────
 
 def _p50(samples: list) -> int | None:
-    """中位数：奇数取中间值，偶数取中间两数均值（取整）；空 → None。"""
+    """中位数：奇数取中间值，偶数取中间两数均值（向下取整）；空 → None。"""
     vals = sorted(v for v in samples if isinstance(v, (int, float)))
     if not vals:
         return None
@@ -438,8 +448,10 @@ def quality_aggregate(perf: dict, passive: list | None = None,
       - ttft_p50 / ttft_text_p50：流式双口径 TTFT 中位数
         （perf 的 ttft_content / ttft_text 桶，仅流式路径写入）；
       - tokens_per_sec：completion_tokens/秒 均值（tps 桶）；
-      - samples：质量桶样本总数（三桶长度和，与
-        status() 面板的 samples 口径一致）；
+      - samples：质量桶样本总数（ttft_content /
+        ttft_text / tps 三桶长度和；status() 面板
+        的 samples 是旧 ttft/tps 两桶长度和，口径
+        不同——本聚合只读流式口径桶，不含旧桶）；
       - water_hits：该 (账号,模型) 注水嫌疑命中数（被动
         事件 + 探针 severity suspect/watered 次数）。
       - success_rate：water 不记成功/失败计数 → 不可用，
@@ -495,6 +507,8 @@ def quality_aggregate(perf: dict, passive: list | None = None,
         "success_rate_note": "water 不记成功/失败计数，成功率不可用；以 samples（质量桶样本数）代替",
         "bucketing": "nonstream_excluded",
         "bucketing_note": "非流式样本（ttft_ms=latency_ms）只进旧 ttft/tps 桶；ttft_p50/ttft_text_p50 仅聚合流式口径（ttft_content/ttft_text 仅流式路径写入），p50 不被污染",
+        "caliber_note": "三列口径：ttft_p50=首个内容 delta 到达时刻（content/refusal/reasoning_content/reasoning/tool_calls 任一非空；prefetched 路径含嗅探门 peek 等待）/ ttft_text_p50=首个可见文本 delta（content/refusal，剥离 thinking/reasoning）/ tokens_per_sec=completion_tokens/秒（旧 tps 桶口径）",
+        "water_hits_note": "按 (账号,模型) 滚动窗口累计：被动事件（PASSIVE_KEEP=50 条滚动保留、同 key 最近 10 条内去重）+ 探针 severity suspect/watered 命中次数；非请求数（一次请求至多产生一条被动记录）",
     }
 
 
