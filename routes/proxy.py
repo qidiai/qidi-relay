@@ -524,6 +524,12 @@ def _feature_budget() -> bool:
 # 嗅探门内容判定的字段集（OpenAI 形流式帧，防御式逐字段取）
 _GATE_CONTENT_FIELDS = ("content", "refusal", "reasoning_content",
                         "reasoning", "tool_calls", "function_call")
+# 可见文本字段集（_GATE_CONTENT_FIELDS 子集，阶段 D / 方案 §6
+# 双口径 TTFT 用）：content/refusal ——剥离 thinking/reasoning
+# （reasoning_content/reasoning 是思考过程，tool_calls/
+# function_call 非纯文本）。与 _GATE_CONTENT_FIELDS 同源定义，
+# 避免两处字段集漂移。
+_TTFT_TEXT_FIELDS = ("content", "refusal")
 
 
 def _gate_has_content(obj: dict) -> bool:
@@ -716,6 +722,13 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     line_buf = ""
     model_returned = None
     ttft_ms = None
+    # 双口径 TTFT（阶段 D / 方案 §6）：首个内容 delta / 首个
+    # 可见文本 delta 的到达时刻（毫秒）。None = 该口径本流未
+    # 出现（如纯推理流无可见文本 → ttft_text_ms 保持 None）。
+    # 值在 finally 记账段直接消费（water.observe）——不新增
+    # 函数参数，值在函数内闭环。
+    ttft_content_ms = None
+    ttft_text_ms = None
     saw_done = False
     rid = registry.register(model, load_key or uid, stream=True)
 
@@ -725,7 +738,8 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
         提炼为局部函数：prefetched 预读字节与后续实时字节必须走
         同一条处理路径——两份拷贝迟早漂移（0929 换号重构的同源教训）。
         """
-        nonlocal usage_captured, line_buf, model_returned, ttft_ms, saw_done
+        nonlocal usage_captured, line_buf, model_returned, ttft_ms
+        nonlocal ttft_content_ms, ttft_text_ms, saw_done
         registry.touch(rid, len(chunk))
         if ttft_ms is None:
             # 注：prefetched 路径下首字节时间含 peek 同步耗时（阶段 D
@@ -743,6 +757,38 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
             m = _extract_model_from_line(line)
             if m and not model_returned:
                 model_returned = m
+            if ttft_content_ms is None or ttft_text_ms is None:
+                # 双口径 TTFT 采集（阶段 D / 方案 §6）：解
+                # data: 帧逐字段判定（字段集与嗅探门
+                # _GATE_CONTENT_FIELDS 同源——共享常量，
+                # 避免两处漂移；行解析口径与门一致，整行
+                # 到达才计）。两口径都集齐后停止解析
+                # （纯开销门）。
+                if line.startswith("data:"):
+                    try:
+                        obj = json.loads(line[5:].strip())
+                    except (ValueError, TypeError):
+                        obj = None
+                    if isinstance(obj, dict):
+                        for choice in obj.get("choices") or ():
+                            if not isinstance(choice, dict):
+                                continue
+                            delta = choice.get("delta")
+                            if not isinstance(delta, dict):
+                                continue
+                            now_ms = None
+                            for field in _GATE_CONTENT_FIELDS:
+                                if not delta.get(field):
+                                    continue
+                                if now_ms is None:
+                                    now_ms = int(
+                                        (time.perf_counter() - started)
+                                        * 1000)
+                                if ttft_content_ms is None:
+                                    ttft_content_ms = now_ms
+                                if (field in _TTFT_TEXT_FIELDS
+                                        and ttft_text_ms is None):
+                                    ttft_text_ms = now_ms
 
     try:
         if prefetched is not None:
@@ -813,7 +859,9 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     )
     # 注水检测：核对上游实际返回的模型名 + 记录性能画像
     water.observe(uid, model, model_returned, usage_captured,
-                  ttft_ms=ttft_ms, total_ms=latency_ms)
+                  ttft_ms=ttft_ms, total_ms=latency_ms,
+                  ttft_content_ms=ttft_content_ms,
+                  ttft_text_ms=ttft_text_ms)
     activity.add("ok", f"{model} · 账号 {uid}（流式）", model=model, user_id=uid,
                  latency_ms=latency_ms,
                  tokens=(usage_captured or {}).get("total_tokens", 0), status=200)

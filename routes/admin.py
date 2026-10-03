@@ -810,6 +810,26 @@ def api_watercheck():
     return jsonify(water.status())
 
 
+@bp.route("/stats/quality")
+@check_admin_auth
+def api_stats_quality():
+    """账号资格评分 v0（方案 §6）：按 (账号, 模型) 聚合流式
+    双口径 TTFT p50 / tokens_per_sec 均值 / 样本数 / 注水
+    嫌疑命中。
+
+    数据源 = water_check.json perf 结构（water 单例，与
+    /api/watercheck 同源读写，不另起解析）。is_stream 分桶：
+    非流式样本直接排除（见响应 bucketing 字段）；water 不记
+    成功/失败计数，success_rate 不可用，以 samples 代替
+    （见 success_rate_note）。
+    """
+    try:
+        return jsonify(water.quality_rows())
+    except Exception as e:
+        log.error("质量聚合生成失败: %s", e)
+        return jsonify({"error": str(e)[:200]}), 500
+
+
 # 注水检测模型清单缓存：上游 /v1/models 拉一次用 10 分钟，避免管理面板轮询打上游
 _models_cache = {"ts": 0.0, "ids": []}
 _MODELS_TTL = 600

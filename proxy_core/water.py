@@ -142,16 +142,25 @@ class WaterCheck:
     # ─── 被动观测：每次转发调用 ─────────────────────────────
     def observe(self, uid: str, model_requested: str, model_returned: str,
                 usage: dict | None, ttft_ms: int | None = None,
-                total_ms: int | None = None):
-        """记录一次真实请求的指纹信号。异常绝不能影响转发主流程。"""
+                total_ms: int | None = None,
+                ttft_content_ms: int | None = None,
+                ttft_text_ms: int | None = None):
+        """记录一次真实请求的指纹信号。异常绝不能影响转发主流程。
+
+        ttft_content_ms/ttft_text_ms（阶段 D / 方案 §6）：流式
+        双口径 TTFT，可选参数——缺省 None 时行为与旧版逐字节
+        一致（不写新键；现有调用点/测试零回归）。
+        """
         try:
             self._observe_inner(uid, model_requested, model_returned,
-                                usage, ttft_ms, total_ms)
+                                usage, ttft_ms, total_ms,
+                                ttft_content_ms, ttft_text_ms)
         except Exception as e:
             log.error("water.observe 异常（忽略）: %s", e)
 
     def _observe_inner(self, uid, model_requested, model_returned,
-                       usage, ttft_ms, total_ms):
+                       usage, ttft_ms, total_ms,
+                       ttft_content_ms=None, ttft_text_ms=None):
         verdict = classify_model_name(model_requested, model_returned)
         key = f"{uid}|{model_requested}"
         dirty = False
@@ -178,6 +187,26 @@ class WaterCheck:
                 if ttft_ms:
                     p["ttft"].append(int(ttft_ms))
                     p["ttft"] = p["ttft"][-PERF_SAMPLES:]
+                    dirty = True
+                # 双口径 TTFT（阶段 D / 方案 §6）：仅流式
+                # 路径（_stream_body）传入；缺省 None →
+                # 不写键。旧文件读入无此键按 None 处理
+                # （缺键兼容）；与旧 ttft/tps 并存不替换
+                # （回滚后旧口径仍完整——§2 持久化文件
+                # 允许新增字段）。采样窗口与淘汰逻辑
+                # 与旧桶一致（PERF_SAMPLES 滚动）。
+                # 判存用 is not None 而非真值——0ms 是
+                # 合法采样（旧桶 if ttft_ms 口径不动，
+                # 保持逐字节兼容）。
+                if ttft_content_ms is not None:
+                    p.setdefault("ttft_content", []).append(
+                        int(ttft_content_ms))
+                    p["ttft_content"] = p["ttft_content"][-PERF_SAMPLES:]
+                    dirty = True
+                if ttft_text_ms is not None:
+                    p.setdefault("ttft_text", []).append(
+                        int(ttft_text_ms))
+                    p["ttft_text"] = p["ttft_text"][-PERF_SAMPLES:]
                     dirty = True
                 ct = usage.get("completion_tokens", 0)
                 if ct and total_ms and total_ms > 0:
@@ -370,6 +399,103 @@ class WaterCheck:
                 "perf": perf,
                 "canary_count": len(CANARIES),
             }
+
+    # ─── 资格评分 v0（方案 §6）─────────────────────────────
+    def quality_rows(self) -> dict:
+        """聚合 perf 结构 → 资格评分行（GET /api/stats/quality
+        数据源）。快照在锁内取；聚合算法为纯函数
+        quality_aggregate（可单测，不依赖单例状态）。"""
+        with self._lock:
+            perf = {
+                k: {bk: list(bv) for bk, bv in v.items()}
+                for k, v in self.perf.items()
+            }
+            passive = list(self.passive)
+            probes = self.probes
+        return quality_aggregate(perf, passive, probes)
+
+
+# ─── 资格评分 v0（方案 §6）─────────────────────────────────────
+
+def _p50(samples: list) -> int | None:
+    """中位数：奇数取中间值，偶数取中间两数均值（取整）；空 → None。"""
+    vals = sorted(v for v in samples if isinstance(v, (int, float)))
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    if n % 2:
+        return int(vals[mid])
+    return int((vals[mid - 1] + vals[mid]) / 2)
+
+
+def quality_aggregate(perf: dict, passive: list | None = None,
+                      probes: dict | None = None) -> dict:
+    """按 (账号, 模型) 聚合资格评分 v0（数据源 water_check.json
+    perf 结构，读写均走 water 单例——不另起解析）。
+
+    每行字段：
+      - ttft_p50 / ttft_text_p50：流式双口径 TTFT 中位数
+        （perf 的 ttft_content / ttft_text 桶，仅流式路径写入）；
+      - tokens_per_sec：completion_tokens/秒 均值（tps 桶）；
+      - samples：质量桶样本总数（三桶长度和，与
+        status() 面板的 samples 口径一致）；
+      - water_hits：该 (账号,模型) 注水嫌疑命中数（被动
+        事件 + 探针 severity suspect/watered 次数）。
+      - success_rate：water 不记成功/失败计数 → 不可用，
+        以 samples 代替并注明（success_rate_note）。
+
+    is_stream 分桶（直接排除）：非流式请求 observe 时不传
+    双口径参数（ttft_ms=total_ms=latency_ms），样本只进旧
+    ttft/tps 桶；本聚合的 p50 只读流式口径桶，非流式延迟
+    不污染 p50。旧 ttft/tps 桶继续服务 /api/watercheck 面板
+    （status()），互不影响。
+    """
+    passive = passive if passive is not None else []
+    probes = probes if probes is not None else {}
+    hits: dict = {}
+    for ev in passive:
+        if isinstance(ev, dict) and ev.get("key"):
+            hits[ev["key"]] = hits.get(ev["key"], 0) + 1
+    for v in probes.values():
+        if not isinstance(v, dict):
+            continue
+        for r in [v.get("last")] + list(v.get("history") or ()):
+            if (isinstance(r, dict)
+                    and r.get("severity") in ("watered", "suspect")
+                    and r.get("user_id") is not None):
+                key = f"{r.get('user_id')}|{r.get('model', '')}"
+                hits[key] = hits.get(key, 0) + 1
+    rows = []
+    for key, p in perf.items():
+        if not isinstance(p, dict) or "|" not in key:
+            continue
+        uid, model = key.split("|", 1)
+        ttft_content = [v for v in (p.get("ttft_content") or ())
+                        if isinstance(v, (int, float))]
+        ttft_text = [v for v in (p.get("ttft_text") or ())
+                     if isinstance(v, (int, float))]
+        tps = [v for v in (p.get("tps") or ())
+               if isinstance(v, (int, float))]
+        rows.append({
+            "user_id": uid,
+            "model": model,
+            "ttft_p50": _p50(ttft_content),
+            "ttft_text_p50": _p50(ttft_text),
+            "tokens_per_sec": round(sum(tps) / len(tps), 1) if tps else None,
+            "samples": len(ttft_content) + len(ttft_text) + len(tps),
+            "water_hits": hits.get(key, 0),
+        })
+    rows.sort(key=lambda r: (-r["samples"], r["user_id"], r["model"]))
+    rows = rows[:50]
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "success_rate": None,
+        "success_rate_note": "water 不记成功/失败计数，成功率不可用；以 samples（质量桶样本数）代替",
+        "bucketing": "nonstream_excluded",
+        "bucketing_note": "非流式样本（ttft_ms=latency_ms）只进旧 ttft/tps 桶；ttft_p50/ttft_text_p50 仅聚合流式口径（ttft_content/ttft_text 仅流式路径写入），p50 不被污染",
+    }
 
 
 water = WaterCheck()
