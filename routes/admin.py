@@ -352,6 +352,204 @@ def api_provider_key_remove():
         resp["warning"] = "已移除最后一个 key，该 provider 暂停服务，请重新添加"
     return jsonify(resp)
 
+# ─── Provider 独立启停（T10）────────────────────────────────────────
+# openrouter 等池做成独立可开关：config.json 的 provider 节
+# "enabled": false 即停用（缺省启用）。写盘走文本级结构
+# 保留式——config.json pricing 节存在大小写折叠重复键
+# （deepseek-v4-flash / DeepSeek-V4-Flash），json.load→
+# json.dump 整文件回写会静默消除重复键改变语义，故只在
+# 原文上做外科手术式编辑（锚点定位 + 全文件解析校验）。
+
+def _brace_match(text: str, open_idx: int) -> int:
+    """花括号配对（跳过字符串字面量），返回与 text[open_idx]=='{'
+    匹配的闭括号下标；不配对抛 ValueError。"""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    break
+                i += 1
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError("花括号不配对")
+
+
+def _member_value_span(text: str, start: int, end: int, key: str):
+    """在 [start, end) 内找直辖成员 "key": 的值区间（跳过嵌套
+    对象/数组与字符串字面量，只认本层直辖键）。返回
+    (vstart, vend)（已跳过前导空白、不含尾随逗号）；
+    未找到返回 None。"""
+    i = start
+    depth = 0
+    n = end
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            if depth == 0:
+                k = j + 1
+                while k < n and text[k] in " \t\r\n":
+                    k += 1
+                if k < n and text[k] == ":" and json.loads(text[i:j + 1]) == key:
+                    v = k + 1
+                    while v < n and text[v] in " \t\r\n":
+                        v += 1
+                    ve = v
+                    d2 = 0
+                    while ve < n:
+                        c2 = text[ve]
+                        if c2 == '"':
+                            ve += 1
+                            while ve < n:
+                                if text[ve] == "\\":
+                                    ve += 2
+                                    continue
+                                if text[ve] == '"':
+                                    break
+                                ve += 1
+                        elif c2 in "{[":
+                            d2 += 1
+                        elif c2 in "}]":
+                            if d2 == 0:
+                                break
+                            d2 -= 1
+                        elif c2 == "," and d2 == 0:
+                            break
+                        ve += 1
+                    return (v, ve)
+            i = j + 1
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        i += 1
+    return None
+
+
+def _toggle_provider_in_text(text: str, name: str, enabled: bool) -> str:
+    """文本级结构保留式改写 config.json 全文：把 providers 节内
+    name 块的 enabled 设为 enabled。算法：
+
+    1. 写前全文件 json.loads 校验（坏文件直接拒绝，不落盘）
+    2. 定位 "providers" 节：首次出现 "providers": {，
+       花括号配对得节界（_brace_match 跳过字符串字面量）
+    3. 节内首次出现 "<name>": { 即该 provider 块起点
+       （同名键重复的病理配置由第 5 步复读校验兜底拒绝）
+    4. 块内直辖成员扫描（_member_value_span）：
+       - 有 "enabled" 成员 → 原地替换其值为 true/false
+       - 无 → 在块开头插入 "enabled": true/false,
+         （沿用块内首成员缩进；空块 {} 直接填入）
+    5. 写后复读校验：json.loads(new) 成功且 providers[name]
+       .enabled 确为 enabled——任一失败抛 ValueError，
+       调用方据此 500，原文一字不动，绝不半截
+    """
+    import re
+    json.loads(text)  # 写前全文件校验
+    m = re.search(r'"providers"\s*:\s*\{', text)
+    if not m:
+        raise ValueError('config.json 无 "providers" 节')
+    sec_open = m.end() - 1
+    sec_end = _brace_match(text, sec_open)
+    pat = re.compile('"' + re.escape(name) + r'"\s*:\s*\{')
+    pm = pat.search(text, m.end(), sec_end)
+    if not pm:
+        raise ValueError('providers 节内无 provider「%s」' % name)
+    block_open = pm.end() - 1
+    block_end = _brace_match(text, block_open)
+    val = "true" if enabled else "false"
+    span = _member_value_span(text, block_open + 1, block_end, "enabled")
+    if span:
+        new_text = text[:span[0]] + val + text[span[1]:]
+    else:
+        after_open = block_open + 1
+        j = after_open
+        while j < block_end and text[j] in " \t\r\n":
+            j += 1
+        if j >= block_end:
+            ins = '"enabled": ' + val  # 空块 {}
+        else:
+            ws = text[after_open:j]
+            if "\n" in ws:
+                indent = ws[ws.rfind("\n") + 1:]
+                ins = "\n" + indent + '"enabled": ' + val + ","
+            else:
+                ins = '"enabled": ' + val + ", "
+        new_text = text[:after_open] + ins + text[after_open:]
+    # 写后复读校验：解析成功且值确实落地
+    check = json.loads(new_text)
+    got = ((check.get("providers") or {}).get(name) or {}).get("enabled")
+    if got is not enabled:
+        raise ValueError("复读校验失败：providers.%s.enabled=%r" % (name, got))
+    return new_text
+
+
+def _set_provider_enabled(name: str, enabled: bool) -> None:
+    """enabled 开关落盘：文本级改写 + 备份 + 原子写（避免半程写坏）。"""
+    import shutil
+    from proxy_core.settings import CONFIG_FILE
+    new_text = _toggle_provider_in_text(
+        CONFIG_FILE.read_text(encoding="utf-8"), name, enabled)
+    bak = CONFIG_FILE.with_name(
+        f"{CONFIG_FILE.name}.bak-provtoggle-{time.strftime('%m%d-%H%M%S')}")
+    shutil.copy2(CONFIG_FILE, bak)
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, CONFIG_FILE)
+
+
+@bp.route("/providers/<name>/enabled", methods=["POST"])
+@check_admin_auth
+def api_provider_enabled(name):
+    """独立启停一个 provider 池（如 openrouter），热生效。
+
+    body: {"enabled": true|false}。停用后：该 provider 模型从
+    /v1/models 消失，命中其模型的请求走模型守卫 404（干净的
+    "池已关闭"语义，不报 500）；key 选择/计账不可达。写
+    config.json 用文本级结构保留式（pricing 大小写折叠重复键
+    不因回写丢失）。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": "enabled 必须为布尔值（true/false）"}), 400
+    name = str(name or "").strip()
+    if not isinstance((load_config().get("providers") or {}).get(name), dict):
+        return jsonify({"error": f"provider「{name}」不存在"}), 404
+    try:
+        _set_provider_enabled(name, enabled)
+    except (ValueError, OSError) as e:
+        log.error("provider「%s」enabled 写盘失败: %s", name, e)
+        return jsonify({"error": f"写 config.json 失败: {e}"}), 500
+    providers.all_providers()  # 立即触发重载（mtime 热生效）
+    _provider_cache.update(ts=0, data=None)  # 击穿面板缓存，卡片即时反映
+    activity.add("info",
+                 f"Provider「{name}」已{'启用' if enabled else '停用'}",
+                 model=name)
+    return jsonify({"provider": name, "enabled": enabled})
+
+
 
 @bp.route("/roles")
 @check_admin_auth
@@ -677,6 +875,7 @@ def api_providers_info():
             first_ok = next((a for a in accounts if a["ok"] and a["logged_in"]), None)
             out.append({
                 "name": prov["name"],
+                "enabled": prov.get("enabled", True),
                 "base_url": prov["base_url"],
                 "models": prov["models"],
                 "ok": any_ok,
@@ -701,6 +900,7 @@ def api_providers_info():
             any_ok = any(a["ok"] and a["logged_in"] for a in accounts)
             out.append({
                 "name": prov["name"],
+                "enabled": prov.get("enabled", True),
                 "base_url": prov["base_url"],
                 "models": prov["models"],
                 "ok": any_ok,
@@ -723,6 +923,7 @@ def api_providers_info():
             any_ok = any(a["ok"] and a["logged_in"] for a in accounts)
             out.append({
                 "name": prov["name"],
+                "enabled": prov.get("enabled", True),
                 "base_url": prov["base_url"],
                 "models": prov["models"] + [
                     "{} ⇒ {}".format(a, t)
@@ -740,6 +941,7 @@ def api_providers_info():
         _amap = prov.get("model_aliases") or {}
         item = {
             "name": prov["name"],
+            "enabled": prov.get("enabled", True),
             "base_url": prov["base_url"],
             "models": prov["models"] + ["{} ⇒ {}".format(a, t) for a, t in _amap.items() if a not in prov["models"]],
             "ok": False,

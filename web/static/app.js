@@ -671,6 +671,10 @@ function renderProviderCard(p) {
   const stateBadge = p.ok
     ? '<span class="badge on">已连接</span>'
     : '<span class="badge quota">不可达</span>';
+  // T10: 启用开关两态（停用中：模型从 /v1/models 消失，请求走模型守卫 404）
+  const enBadge = p.enabled === false
+    ? '<span class="badge off" title="已停用：模型从 /v1/models 消失，请求走模型守卫 404">已停用</span>'
+    : '<span class="badge on" title="启用中">启用中</span>';
   const keyBadge = p.key_count > 1 ? `<span class="badge glm">${p.key_count} key 轮换</span>` : "";
   const sub = p.subscription || null;
   const payBadge = sub && sub.has_payment_method ? '<span class="badge glm">已绑支付方式</span>' : "";
@@ -729,19 +733,41 @@ function renderProviderCard(p) {
     ? (sub.hard_limit_usd != null && sub.hard_limit_usd < 1e8 ? `硬限额 <b>$${fmtFull(sub.hard_limit_usd)}</b>` : "限额 <b>不限</b>")
     : `订阅信息不可用（HTTP ${p.subscription_status || "—"}）`;
   return `
-  <div class="acc-card ${p.ok ? "" : "disabled"}">
+  <div class="acc-card ${p.ok && p.enabled !== false ? "" : "disabled"}">
     <div class="acc-top">
       <span class="acc-led ${p.ok ? "on" : "off"}"></span>
       <span class="acc-name">${esc(p.name)}</span>
       <span class="acc-id">${esc(host)}</span>
     </div>
-    <div class="acc-badges">${stateBadge}${keyBadge}${payBadge}${modelBadges}</div>
+    <div class="acc-badges">${stateBadge}${enBadge}${keyBadge}${payBadge}${modelBadges}</div>
     ${(p.atomcode || p.cline) ? "" : `<div class="acc-meta"><span>累计用量 <b>${usageTxt}</b></span><span>${limitTxt}</span></div>`}
     ${acSection}
     ${clSection}
     ${keySection}
+    <div class="acc-actions">
+      <button class="btn tiny ${p.enabled === false ? "primary" : "danger"}" onclick="toggleProvider('${esc(p.name)}', ${p.enabled === false})">${p.enabled === false ? "启用" : "停用"}</button>
+    </div>
     ${p.ok ? "" : `<div class="acc-meta"><span class="dim">${esc(p.error || "连接失败")}</span></div>`}
   </div>`;
+}
+
+// T10: Provider 独立启停（POST /api/providers/<name>/enabled，
+// 文本级结构保留式写 config.json，热生效）
+async function toggleProvider(pname, enabled) {
+  if (!confirm(`确认${enabled ? "启用" : "停用"} Provider「${pname}」？${enabled ? "" : "停用后其模型从 /v1/models 消失，请求将返回 404（池已关闭）。"}`)) return;
+  try {
+    const r = await api("/api/providers/" + encodeURIComponent(pname) + "/enabled", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      toast(enabled ? `Provider「${pname}」已启用` : `Provider「${pname}」已停用`);
+      loadProvidersInfo();
+    } else {
+      toast(d.error || "操作失败", true);
+    }
+  } catch (e) { toast("操作失败: " + e.message, true); }
 }
 
 async function uploadAtomcode(pname) {

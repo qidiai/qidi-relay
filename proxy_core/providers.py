@@ -114,6 +114,17 @@ def _parse_aliases(name: str, p: dict) -> dict:
     return out
 
 
+def is_enabled(p: dict) -> bool:
+    """provider 启用开关（config 节 enabled，缺省启用，T10）。
+
+    非布尔防御：config 手误（如 "enabled": "false" 字符串、
+    0/1 数字）一律按启用处理——宁可用到报错的池，也不静默
+    关错池（isinstance 检查，非真值化）。
+    """
+    v = p.get("enabled", True) if isinstance(p, dict) else True
+    return v if isinstance(v, bool) else True
+
+
 def _load_providers() -> dict:
     """读取 config.json 的 providers 配置（mtime 变化时自动重载）。"""
     global _cache
@@ -132,6 +143,7 @@ def _load_providers() -> dict:
         for name, p in (cfg.get("providers") or {}).items():
             if not isinstance(p, dict):
                 continue
+            enabled = is_enabled(p)  # T10: enabled 开关（缺省启用）
             base_url = (p.get("base_url") or "").rstrip("/")
             models = [m for m in (p.get("models") or []) if isinstance(m, str)]
             if p.get("type") == "atomcode":
@@ -139,6 +151,7 @@ def _load_providers() -> dict:
                 if models:
                     provs[name] = {
                         "name": name,
+                        "enabled": enabled,
                         "type": "atomcode",
                         "base_url": base_url or atomcode.DEFAULT_LLM_BASE,
                         "api_key": None,
@@ -153,6 +166,7 @@ def _load_providers() -> dict:
                 if models:
                     provs[name] = {
                         "name": name,
+                        "enabled": enabled,
                         "type": "cline",
                         "base_url": cline.API_BASE,
                         "api_key": None,
@@ -171,6 +185,7 @@ def _load_providers() -> dict:
                     base = base_url or (chs[0].api_base if chs else minicode.API_BASE_CN)
                     provs[name] = {
                         "name": name,
+                        "enabled": enabled,
                         "type": "minicode",
                         "base_url": base,
                         "api_key": None,
@@ -185,6 +200,7 @@ def _load_providers() -> dict:
                 if base_url and keys and models:
                     provs[name] = {
                         "name": name,
+                        "enabled": enabled,
                         "base_url": base_url,
                         "api_key": keys[0]["key"],  # 兼容字段（water 探针等单 key 消费者）
                         "keys": keys,
@@ -230,6 +246,8 @@ def match(model: str):
     if not model:
         return None
     for prov in _load_providers().values():
+        if not prov.get("enabled", True):
+            continue  # T10: 已停用——池关闭，模型不可达（请求落模型守卫 404）
         if model in prov["models"] or model in (prov.get("model_aliases") or {}):
             return prov
     return None
@@ -243,6 +261,8 @@ def all_models() -> list:
     """
     out = []
     for prov in _load_providers().values():
+        if not prov.get("enabled", True):
+            continue  # T10: 已停用——模型从 /v1/models 消失
         for m in prov["models"]:
             out.append({"id": m, "object": "model", "owned_by": prov["name"]})
         for a in (prov.get("model_aliases") or {}):
@@ -253,7 +273,12 @@ def all_models() -> list:
 
 
 def all_providers() -> dict:
-    """所有已配置的外部 provider（含 key，仅供服务端管理接口使用，禁止直接返给前端）。"""
+    """所有已配置的外部 provider（含 key，仅供服务端管理接口使用，禁止直接返给前端）。
+
+    T10: 含已停用（enabled=false）的 provider——其 prov 带
+    "enabled": False，管理面板据此展示"已停用"态并可再启用；
+    路由/模型列表层（match/all_models）已将其跳过。
+    """
     return _load_providers()
 
 

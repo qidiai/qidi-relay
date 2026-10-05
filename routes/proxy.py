@@ -1164,7 +1164,10 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
     _str = lambda xs: {x for x in xs if isinstance(x, str)}  # 防 config 手误非 str
     _provider_models = set()
     for _pname, _p in (_cfg_g.get("providers") or {}).items():
-        if isinstance(_p, dict):
+        # T10: enabled=false 的 provider 已停用——其模型移出白名单，
+        # 请求落模型守卫 404（干净的"池已关闭"语义，与 match/
+        # all_models 跳过同口径；绝不原样落账号池静默假活）。
+        if isinstance(_p, dict) and providers.is_enabled(_p):
             _provider_models |= _str(_p.get("models") or [])
             # 0928: model_aliases 别名键一并入白名单（放行守卫）；
             # 别名键带前缀，不会与池模型大小写不敏感撞名，
