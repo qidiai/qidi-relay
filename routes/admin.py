@@ -549,6 +549,475 @@ def api_provider_enabled(name):
                  model=name)
     return jsonify({"provider": name, "enabled": enabled})
 
+# ─── 页面添加新渠道（F1）────────────────────────────────────────
+# 面板「+ 添加渠道」：config.json providers 节块首插入新
+# provider 块。文本级结构保留式（T10 同款纪律——pricing
+# 节大小写折叠重复键不因回写丢失）。
+
+
+def _provider_name_ok(name: str) -> bool:
+    import re
+    return bool(re.match(r"^[A-Za-z0-9_-]+$", name))
+
+
+def _add_provider_in_text(text: str, name: str, base_url: str,
+                          api_key: str, enabled: bool) -> str:
+    """文本级结构保留式改写 config.json 全文：在 providers
+    节块首插入新 provider 块。算法：
+
+    1. 写前全文件 json.loads 校验（坏文件直接拒绝）
+    2. 锚点 "providers": { 定位节（首次出现），
+       _brace_match 花括号配对（跳过字符串字面量）得节界
+    3. 节块首插入新块（沿用节内首成员缩进；空节取
+       "providers" 键行缩进 +2），块结构：
+       {"base_url", "api_keys":[{key,label:"主key"}],
+       "models":[], "enabled"}——models 空初始（F2 探测填写）
+    4. 写后复读校验：json.loads(new) 成功且新块字段确已落地
+    """
+    import re
+    json.loads(text)  # 写前全文件校验
+    m = re.search(r'"providers"\s*:\s*\{', text)
+    if not m:
+        raise ValueError('config.json 无 "providers" 节')
+    sec_open = m.end() - 1
+    sec_end = _brace_match(text, sec_open)
+    after_open = sec_open + 1
+    j = after_open
+    while j < sec_end and text[j] in " \t\r\n":
+        j += 1
+    # 节成员缩进：优先沿用节内首成员缩进；空节取
+    # "providers" 键行缩进 + 2（标准 2 空格 JSON）
+    if j < sec_end:
+        ws = text[after_open:j]
+        member_indent = ws[ws.rfind("\n") + 1:] if "\n" in ws else ""
+    else:
+        ls = text.rfind("\n", 0, m.start())
+        ls = ls + 1 if ls >= 0 else 0
+        member_indent = text[ls:m.start()] + "  "
+    inner = member_indent + "  "
+    val = "true" if enabled else "false"
+    block = (
+        '%s: {\n'
+        '%s"base_url": %s,\n'
+        '%s"api_keys": [{"key": %s, "label": "主key"}],\n'
+        '%s"models": [],\n'
+        '%s"enabled": %s\n'
+        '%s}'
+    ) % (json.dumps(name, ensure_ascii=False),
+         inner, json.dumps(base_url, ensure_ascii=False),
+         inner, json.dumps(api_key, ensure_ascii=False),
+         inner,
+         inner, val,
+         member_indent)
+    if j >= sec_end:
+        # 空节 {}：填入并补节闭括号缩进
+        ls = text.rfind("\n", 0, m.start())
+        ls = ls + 1 if ls >= 0 else 0
+        sec_indent = text[ls:m.start()]
+        ins = "\n" + member_indent + block + "\n" + sec_indent
+    else:
+        ins = "\n" + member_indent + block + ","
+    new_text = text[:after_open] + ins + text[after_open:]
+    # 写后复读校验：解析成功且新块字段确已落地
+    check = json.loads(new_text)
+    got = (check.get("providers") or {}).get(name)
+    if (not isinstance(got, dict)
+            or got.get("base_url") != base_url
+            or got.get("enabled") is not enabled
+            or got.get("models") != []
+            or not isinstance(got.get("api_keys"), list)
+            or not got["api_keys"]
+            or got["api_keys"][0].get("key") != api_key
+            or got["api_keys"][0].get("label") != "主key"):
+        raise ValueError("复读校验失败：providers.%s 字段未正确落地" % name)
+    return new_text
+
+
+def _set_provider_add(name: str, base_url: str, api_key: str,
+                      enabled: bool) -> None:
+    """新 provider 落盘：文本级改写 + 备份 + 原子写（避免半程写坏）。"""
+    import shutil
+    from proxy_core.settings import CONFIG_FILE
+    new_text = _add_provider_in_text(
+        CONFIG_FILE.read_text(encoding="utf-8"),
+        name, base_url, api_key, enabled)
+    bak = CONFIG_FILE.with_name(
+        f"{CONFIG_FILE.name}.bak-provadd-{time.strftime('%m%d-%H%M%S')}")
+    shutil.copy2(CONFIG_FILE, bak)
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, CONFIG_FILE)
+
+
+@bp.route("/providers/add", methods=["POST"])
+@check_admin_auth
+def api_provider_add():
+    """面板「+ 添加渠道」：新增一个外部 provider 池。
+
+    body: {"name": "xxx", "base_url": "https://...",
+    "api_key": "sk-...", "enabled": true（可缺省）}
+    校验：name 匹配 ^[A-Za-z0-9_-]+$ 且在 providers 节
+    唯一、base_url 以 https:// 开头、api_key 非空——
+    任一不满足 400 且 config.json 逐字节不动。通过则
+    文本级结构保留式插入 providers 节块首（models 空
+    初始，由「探测模型」填写），热生效。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    base_url = str(data.get("base_url") or "").strip()
+    api_key = str(data.get("api_key") or "").strip()
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = True
+    if not name or not _provider_name_ok(name):
+        return jsonify({"error": "渠道名仅允许字母/数字/下划线/连字符"}), 400
+    if not base_url.startswith("https://"):
+        return jsonify({"error": "base_url 必须以 https:// 开头"}), 400
+    if not api_key:
+        return jsonify({"error": "api_key 不能为空"}), 400
+    if name in (load_config().get("providers") or {}):
+        return jsonify({"error": f"渠道「{name}」已存在"}), 400
+    try:
+        _set_provider_add(name, base_url, api_key, enabled)
+    except (ValueError, OSError) as e:
+        log.error("provider「%s」添加写盘失败: %s", name, e)
+        return jsonify({"error": f"写 config.json 失败: {e}"}), 500
+    providers.all_providers()  # 立即触发重载（mtime 热生效）
+    _provider_cache.update(ts=0, data=None)  # 击穿面板缓存，卡片即时反映
+    activity.add("info", f"Provider「{name}」已添加（{base_url}）", model=name)
+    return jsonify({"provider": name, "base_url": base_url, "enabled": enabled})
+
+
+# ─── 一键探测上游可用模型（F2）────────────────────────────────
+# 卡片「探测模型」：GET {base_url}/models（带第一个 key）
+# 拿候选 → keyword 子串过滤（大小写不敏感）→ 最多探 40
+# 个、并发 4（每个 1-token chat，单次超时 20s）→ 分类
+# 汇总；勾选后经 /providers/<name>/models 文本级写回。
+
+_PROBE_MAX = 40          # 最多探测模型数
+_PROBE_CONCURRENCY = 4   # 并发上限
+_PROBE_TIMEOUT_S = 20    # 单次探测超时（秒）
+
+
+def _provider_first_key(name: str, p: dict):
+    """provider 的第一个 key（探测鉴权用；无 key 返回 None）。"""
+    entries = providers._parse_keys(name, p)
+    return entries[0]["key"] if entries else None
+
+
+def _upstream_model_ids(payload) -> list:
+    """从 GET /models 响应体提取模型 id 列表（兼容
+    OpenAI {"data":[...]} / 纯对象数组 / 纯字符串数组
+    三种形态）。"""
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, str) and it.strip():
+            out.append(it.strip())
+        elif (isinstance(it, dict) and isinstance(it.get("id"), str)
+                and it["id"].strip()):
+            out.append(it["id"].strip())
+    return out
+
+
+def _probe_one(client, base_url: str, key: str, model_id: str):
+    """单模型可用性探测：1-token chat（max_tokens=1），
+    单次超时 _PROBE_TIMEOUT_S。返回 (ok_item, fail_item)
+    恰有一个非 None。"""
+    t0 = time.perf_counter()
+    try:
+        r = client.post(
+            base_url + "/chat/completions",
+            headers={"Authorization": f"Bearer {key}",
+                     "Accept": "application/json"},
+            json={"model": model_id,
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "max_tokens": 1})
+        ms = int((time.perf_counter() - t0) * 1000)
+        if 200 <= r.status_code < 300:
+            return {"id": model_id, "latency_ms": ms}, None
+        why = ""
+        try:
+            err = r.json().get("error")
+            why = str(err)[:120] if err else ""
+        except Exception:
+            why = (r.text or "")[:120]
+        return None, {"id": model_id, "status": r.status_code,
+                      "why": why or f"HTTP {r.status_code}"}
+    except httpx.TimeoutException:
+        return None, {"id": model_id, "status": "timeout",
+                      "why": f"超时（>{_PROBE_TIMEOUT_S}s）"}
+    except Exception as e:
+        return None, {"id": model_id, "status": "error",
+                      "why": str(e)[:120]}
+
+
+@bp.route("/providers/<name>/probe", methods=["POST"])
+@check_admin_auth
+def api_provider_probe(name):
+    """一键探测上游可用模型。
+
+    body: {"keyword": ""}（可空）。流程：GET {base_url}/
+    models（带该 provider 第一个 key）拿候选 id → keyword
+    子串过滤（大小写不敏感）→ 最多探 40 个、并发 4（每个
+    1-token chat，单次超时 20s）→ 分类汇总。base_url 不通
+    / 无 /models 端点 → 502 + 可读错误。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    data = request.get_json(force=True, silent=True) or {}
+    keyword = str(data.get("keyword") or "").strip()
+    name = str(name or "").strip()
+    provs = load_config().get("providers") or {}
+    p = provs.get(name)
+    if not isinstance(p, dict):
+        return jsonify({"error": f"provider「{name}」不存在"}), 404
+    base_url = str(p.get("base_url") or "").rstrip("/")
+    key = _provider_first_key(name, p)
+    if not base_url or not key:
+        return jsonify({"error": f"provider「{name}」配置不完整（缺 base_url/api_keys）"}), 400
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=10) as client:
+            r = client.get(base_url + "/models", headers=headers)
+            if r.status_code != 200:
+                return jsonify({"error": f"GET /models 返回 {r.status_code}（{base_url} 无可用模型列表端点）"}), 502
+            try:
+                candidates = _upstream_model_ids(r.json())
+            except Exception as e:
+                return jsonify({"error": f"/models 响应解析失败: {e}"}), 502
+    except Exception as e:
+        return jsonify({"error": f"连接 {base_url} 失败: {str(e)[:120]}"}), 502
+    if keyword:
+        kl = keyword.lower()
+        candidates = [m for m in candidates if kl in m.lower()]
+    probe_set = candidates[:_PROBE_MAX]
+    ok, fail = [], []
+    if probe_set:
+        with httpx.Client(timeout=_PROBE_TIMEOUT_S) as client:
+            with ThreadPoolExecutor(max_workers=_PROBE_CONCURRENCY) as pool:
+                futs = [pool.submit(_probe_one, client, base_url, key, m)
+                        for m in probe_set]
+                for fut in futs:
+                    ok_item, fail_item = fut.result()
+                    if ok_item:
+                        ok.append(ok_item)
+                    else:
+                        fail.append(fail_item)
+    return jsonify({"total": len(candidates), "probed": len(probe_set),
+                    "ok": ok, "fail": fail})
+
+
+def _set_provider_models(name: str, models: list) -> None:
+    """models 列表写回 provider 配置：文本级结构保留式
+    （复用 _member_value_span 定位直辖 models 数组原地
+    替换；无 models 键则块首插入），备份 + 原子写。"""
+    import re
+    import shutil
+    from proxy_core.settings import CONFIG_FILE
+    text = CONFIG_FILE.read_text(encoding="utf-8")
+    json.loads(text)  # 写前全文件校验
+    m = re.search(r'"providers"\s*:\s*\{', text)
+    if not m:
+        raise ValueError('config.json 无 "providers" 节')
+    sec_open = m.end() - 1
+    sec_end = _brace_match(text, sec_open)
+    pat = re.compile('"' + re.escape(name) + r'"\s*:\s*\{')
+    pm = pat.search(text, m.end(), sec_end)
+    if not pm:
+        raise ValueError('providers 节内无 provider「%s」' % name)
+    block_open = pm.end() - 1
+    block_end = _brace_match(text, block_open)
+    new_val = json.dumps(models, ensure_ascii=False)
+    span = _member_value_span(text, block_open + 1, block_end, "models")
+    if span:
+        new_text = text[:span[0]] + new_val + text[span[1]:]
+    else:
+        # 无 models 键：块首插入（沿用 T10 enabled 插入同款缩进逻辑）
+        after_open = block_open + 1
+        j = after_open
+        while j < block_end and text[j] in " \t\r\n":
+            j += 1
+        if j >= block_end:
+            ins = '"models": ' + new_val
+        else:
+            ws = text[after_open:j]
+            if "\n" in ws:
+                indent = ws[ws.rfind("\n") + 1:]
+                ins = "\n" + indent + '"models": ' + new_val + ","
+            else:
+                ins = '"models": ' + new_val + ", "
+        new_text = text[:after_open] + ins + text[after_open:]
+    # 写后复读校验：解析成功且 models 确已落地
+    check = json.loads(new_text)
+    got = ((check.get("providers") or {}).get(name) or {}).get("models")
+    if got != models:
+        raise ValueError("复读校验失败：providers.%s.models 未正确落地" % name)
+    bak = CONFIG_FILE.with_name(
+        f"{CONFIG_FILE.name}.bak-provmodels-{time.strftime('%m%d-%H%M%S')}")
+    shutil.copy2(CONFIG_FILE, bak)
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, CONFIG_FILE)
+
+
+@bp.route("/providers/<name>/models", methods=["POST"])
+@check_admin_auth
+def api_provider_models(name):
+    """把探测结果选中的模型写回 provider 配置（F2 收尾）。
+
+    body: {"models": ["id1", ...]}。文本级结构保留式替换
+    该 provider 块的 models 数组（pricing 重复键不丢失）；
+    写后该 provider 模型立即进 /v1/models（守卫白名单每
+    请求读 config，天然生效）。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    models = data.get("models")
+    if (not isinstance(models, list)
+            or not all(isinstance(m, str) and m.strip() for m in models)):
+        return jsonify({"error": "models 必须为字符串数组"}), 400
+    name = str(name or "").strip()
+    if not isinstance((load_config().get("providers") or {}).get(name), dict):
+        return jsonify({"error": f"provider「{name}」不存在"}), 404
+    models = [m.strip() for m in models]
+    try:
+        _set_provider_models(name, models)
+    except (ValueError, OSError) as e:
+        log.error("provider「%s」models 写盘失败: %s", name, e)
+        return jsonify({"error": f"写 config.json 失败: {e}"}), 500
+    providers.all_providers()  # 立即触发重载（mtime 热生效）
+    _provider_cache.update(ts=0, data=None)  # 击穿面板缓存，卡片即时反映
+    activity.add("info",
+                 f"Provider「{name}」模型列表已更新（{len(models)} 个）",
+                 model=name)
+    return jsonify({"provider": name, "models": models})
+
+
+# ─── 账号分组标签（F3）────────────────────────────────────────
+# 用户原需求：到期订阅的账号自己改成 free。accounts.json
+# 侧无现成 helper——新建：条目 span 编辑（"user_id": "X"
+# 到下一条 "user_id" 或文本尾为边界），直属 "group" 值
+# 替换；无 group 键则在条目内末尾前插入。文本级保留式
+# （不重排、不丢字段），与 T10 config 手术同纪律。
+
+_ACCOUNT_GROUP_VALUES = ("", "free", "pro")
+
+
+def _set_account_group(uid: str, group: str) -> None:
+    """accounts.json 条目 span 编辑：把 uid 账号的 group
+    设为 group。算法：
+
+    1. 写前全文件 json.loads 校验
+    2. 定位条目：首次出现 "user_id": "<uid>"（键与值间
+       空白任意）；条目 span = 该处到下一条 "user_id"
+       或文本尾
+    3. span 内直辖成员扫描（_member_value_span，深度跟
+       踪只认本层键）：
+       - 有 "group" 成员 → 原地替换其值为新 group
+       - 无 → 条目闭括号前插入 "group": <值>（沿用成员
+         缩进；紧凑格式用逗号空格分隔）
+    4. 写后复读校验：json.loads(new) 成功、目标账号
+       group 确为 group、且其余账号逐字段不变
+    """
+    import re
+    import shutil
+    from proxy_core.settings import ACCOUNTS_FILE
+    from proxy_core.state import am
+
+    def _accs(txt):
+        d = json.loads(txt)
+        return (d.get("accounts") or []) if isinstance(d, dict) else d
+
+    text = ACCOUNTS_FILE.read_text(encoding="utf-8")
+    json.loads(text)  # 写前全文件校验
+    anchor = re.compile(
+        r'"user_id"\s*:\s*' + re.escape(json.dumps(uid, ensure_ascii=False)))
+    mm = anchor.search(text)
+    if not mm:
+        raise ValueError(f"accounts.json 中无账号「{uid}」")
+    entry_start = mm.start()
+    nxt = re.compile(r'"user_id"\s*:')
+    nm = nxt.search(text, mm.end())
+    entry_end = nm.start() if nm else len(text)
+    val = json.dumps(group, ensure_ascii=False)
+    span = _member_value_span(text, entry_start, entry_end, "group")
+    if span:
+        new_text = text[:span[0]] + val + text[span[1]:]
+    else:
+        # 无 group 键：条目闭括号前插入（user_id 是首成员，
+        # 其前最近的 { 即条目开头）
+        open_idx = text.rfind("{", 0, entry_start)
+        close_idx = _brace_match(text, open_idx)
+        k = close_idx
+        while k > 0 and text[k - 1] in " \t\r\n":
+            k -= 1
+        ws = text[k:close_idx]
+        if "\n" in ws:
+            close_indent = ws[ws.rfind("\n") + 1:]
+            member_indent = close_indent + "  "
+            head = text[:k]
+            if not head.rstrip().endswith(","):
+                head += ","  # 新成员前补逗号（原末成员无尾逗号）
+            ins = "\n" + member_indent + '"group": ' + val + "\n" + close_indent
+            new_text = head + ins + text[close_idx:]
+        else:
+            ins = '"group": ' + val + (
+                ", " if not text[:k].rstrip().endswith("{") else "")
+            new_text = text[:k] + ins + text[close_idx:]
+    # 写后复读校验：解析成功、目标 group 落地、其余账号不变
+    before = _accs(text)
+    after = _accs(new_text)
+    if len(before) != len(after):
+        raise ValueError("复读校验失败：账号数变化")
+    tgt = next((a for a in after if a.get("user_id") == uid), None)
+    if tgt is None or tgt.get("group") != group:
+        raise ValueError("复读校验失败：账号 group 未正确落地")
+    for ob, oa in zip(before, after):
+        if ob.get("user_id") == uid:
+            continue  # 目标账号（已单独校验）
+        if ob != oa:
+            raise ValueError("复读校验失败：其他账号被改动")
+    bak = ACCOUNTS_FILE.with_name(
+        f"{ACCOUNTS_FILE.name}.bak-acctgroup-{time.strftime('%m%d-%H%M%S')}")
+    shutil.copy2(ACCOUNTS_FILE, bak)
+    tmp = ACCOUNTS_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, ACCOUNTS_FILE)
+    am._load()  # AccountManager 单例内存热重载
+
+
+@bp.route("/accounts/<uid>/group", methods=["POST"])
+@check_admin_auth
+def api_account_group(uid):
+    """账号分组标签选择器（F3）。
+
+    body: {"group": ""|"free"|"pro"}——严格白名单三值
+    （""=订阅池 / free=免费组 / pro=专业组），其他值
+    400。accounts.json 条目 span 文本级编辑（不碰其他
+    账号），备份 + 原子写，AccountManager 热重载生效。
+    """
+    import re
+    from proxy_core.settings import ACCOUNTS_FILE
+    data = request.get_json(force=True, silent=True) or {}
+    group = data.get("group")
+    if group not in _ACCOUNT_GROUP_VALUES:
+        return jsonify({"error": "group 仅允许 \"\"/free/pro 三值"}), 400
+    uid = str(uid or "").strip()
+    if not re.search(
+            r'"user_id"\s*:\s*' + re.escape(json.dumps(uid, ensure_ascii=False)),
+            ACCOUNTS_FILE.read_text(encoding="utf-8")):
+        return jsonify({"error": f"账号「{uid}」不存在"}), 404
+    try:
+        _set_account_group(uid, group)
+    except (ValueError, OSError) as e:
+        log.error("账号「%s」分组写盘失败: %s", uid, e)
+        return jsonify({"error": f"写 accounts.json 失败: {e}"}), 500
+    return jsonify({"user_id": uid, "group": group})
+
 
 
 @bp.route("/roles")

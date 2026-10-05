@@ -275,8 +275,8 @@ async function loadAccounts() {
       const groupBadge = a.group === "free"
         ? '<span class="badge ext" title="免费额度池">免费组</span>'
         : a.group === "pro"
-          ? '<span class="badge glm" title="Pro 订阅额度池">PRO订阅</span>'
-          : '<span class="badge glm" title="Lite 订阅额度池">Lite订阅</span>';
+          ? '<span class="badge glm" title="专业订阅额度池">专业组</span>'
+          : '<span class="badge glm" title="订阅额度池">订阅池</span>';
       const emailLine = a.email ? `<div class="acc-meta"><span>📧 ${esc(a.email)}</span></div>` : "";
       const load = (inflightData.loads || {})[a.user_id] || 0;
       const loadBadge = load > 0 ? `<span class="badge ext">进行中 ${load}</span>` : "";
@@ -303,6 +303,11 @@ async function loadAccounts() {
         <div class="exp-bar"><i class="${expCls}" style="width:${expPct}%"></i></div>
         <div class="acc-meta"><span>到期 ${esc(a.token_expires)}</span><span>${a.last_used ? "最近调用 " + esc(String(a.last_used).slice(5, 16).replace("T", " ")) : "未使用"}</span></div>
         <div class="acc-actions">
+          <select class="btn tiny" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:inherit" onchange="setAccountGroup('${esc(a.user_id)}', this.value)" title="分组标签（change 即存 config/accounts.json）">
+            <option value=""${a.group === "" ? " selected" : ""}>订阅池</option>
+            <option value="free"${a.group === "free" ? " selected" : ""}>免费组</option>
+            <option value="pro"${a.group === "pro" ? " selected" : ""}>专业组</option>
+          </select>
           <button class="btn tiny ${a.enabled ? "danger" : "primary"}" onclick="toggleAccount('${esc(a.user_id)}', ${!a.enabled})">${a.enabled ? "禁用" : "启用"}</button>
           <button class="btn tiny ghost" onclick="removeAccount('${esc(a.user_id)}')">删除</button>
         </div>
@@ -655,6 +660,7 @@ function ensureProvidersPanel() {
     <div class="panel-head">
       <h2>外部账号 <span class="tag" id="provider-count-tag">EXTERNAL</span></h2>
       <div class="head-actions">
+        <button class="btn tiny primary" onclick="openProviderAddModal()" title="添加新外部渠道（config.json providers 节块首插入，文本级保留式写入）">+ 添加渠道</button>
         <button class="btn tiny" onclick="loadProvidersInfo()" title="重新查询外部账号信息（服务端缓存 120s）">刷新</button>
       </div>
     </div>
@@ -745,6 +751,7 @@ function renderProviderCard(p) {
     ${clSection}
     ${keySection}
     <div class="acc-actions">
+      <button class="btn tiny" onclick="probeModels('${esc(p.name)}')" title="一键探测上游可用模型（GET /models + 1-token 并发探活，最多 40 个/并发 4/单次 20s 超时）">探测模型</button>
       <button class="btn tiny ${p.enabled === false ? "primary" : "danger"}" onclick="toggleProvider('${esc(p.name)}', ${p.enabled === false})">${p.enabled === false ? "启用" : "停用"}</button>
     </div>
     ${p.ok ? "" : `<div class="acc-meta"><span class="dim">${esc(p.error || "连接失败")}</span></div>`}
@@ -768,6 +775,185 @@ async function toggleProvider(pname, enabled) {
       toast(d.error || "操作失败", true);
     }
   } catch (e) { toast("操作失败: " + e.message, true); }
+}
+
+// T11-F1: 页面添加新渠道（POST /api/providers/add，
+// 文本级结构保留式写 config.json providers 节块首）
+function ensureProviderAddModal() {
+  let m = $("providerAddModal");
+  if (m) return m;
+  m = document.createElement("div");
+  m.className = "modal";
+  m.id = "providerAddModal";
+  m.innerHTML = `
+    <div class="modal-box">
+      <h3>添加渠道</h3>
+      <label>渠道名（字母/数字/下划线/连字符，provider 节内唯一）</label>
+      <input class="input" id="pa-name" placeholder="如: myrelay">
+      <label>Base URL（须 https:// 开头）</label>
+      <input class="input" id="pa-baseurl" placeholder="https://api.example.com/v1">
+      <label>API Key</label>
+      <input class="input" id="pa-apikey" placeholder="sk-...">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="pa-enabled" checked> 启用（取消勾选则添加为停用态）</label>
+      <div class="modal-btns">
+        <button class="btn primary" onclick="addProvider()">保存</button>
+        <button class="btn ghost" onclick="closeModal('providerAddModal')">取消</button>
+      </div>
+    </div>`;
+  m.addEventListener("click", e => { if (e.target === m) closeModal("providerAddModal"); });
+  document.body.appendChild(m);
+  return m;
+}
+
+function openProviderAddModal() {
+  ensureProviderAddModal();
+  openModal("providerAddModal");
+}
+
+async function addProvider() {
+  const name = $("pa-name").value.trim();
+  const base_url = $("pa-baseurl").value.trim();
+  const api_key = $("pa-apikey").value.trim();
+  const enabled = $("pa-enabled").checked;
+  if (!name || !base_url || !api_key) { toast("渠道名 / Base URL / API Key 均不能为空", true); return; }
+  try {
+    const r = await api("/api/providers/add", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, base_url, api_key, enabled }),
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      toast(`渠道「${d.provider}」已添加`);
+      closeModal("providerAddModal");
+      ["pa-name", "pa-baseurl", "pa-apikey"].forEach(id => $(id).value = "");
+      $("pa-enabled").checked = true;
+      loadProvidersInfo();
+    } else {
+      toast(d.error || "添加失败", true);
+    }
+  } catch (e) { toast("添加失败: " + e.message, true); }
+}
+
+// T11-F2: 一键探测上游可用模型（POST /api/providers/<name>/probe）
+let probeProvider = null;
+let probeBusy = false;
+
+function ensureProbeModal() {
+  let m = $("probeModal");
+  if (m) return m;
+  m = document.createElement("div");
+  m.className = "modal";
+  m.id = "probeModal";
+  m.innerHTML = `
+    <div class="modal-box" style="width:560px">
+      <h3>探测上游可用模型</h3>
+      <label>关键词过滤（可空，子串匹配，大小写不敏感）</label>
+      <input class="input" id="probe-keyword" placeholder="如: deepseek">
+      <div class="modal-btns">
+        <button class="btn primary" id="probe-run-btn" onclick="runProbe()">开始探测</button>
+        <button class="btn ghost" onclick="closeModal('probeModal')">关闭</button>
+      </div>
+      <p class="hint" id="probe-status"></p>
+      <div id="probe-results"></div>
+    </div>`;
+  m.addEventListener("click", e => { if (e.target === m) closeModal("probeModal"); });
+  document.body.appendChild(m);
+  return m;
+}
+
+function probeModels(pname) {
+  probeProvider = pname;
+  ensureProbeModal();
+  $("probe-keyword").value = "";
+  $("probe-results").innerHTML = "";
+  $("probe-status").textContent = "";
+  openModal("probeModal");
+}
+
+async function runProbe() {
+  if (probeBusy || !probeProvider) return;
+  const keyword = $("probe-keyword").value.trim();
+  probeBusy = true;
+  const btn = $("probe-run-btn");
+  btn.disabled = true;
+  btn.textContent = "探测中…";
+  $("probe-status").textContent = "正在探测…（候选经关键词过滤后最多探 40 个，并发 4，单次 20s 超时）";
+  $("probe-results").innerHTML = "";
+  try {
+    const r = await api("/api/providers/" + encodeURIComponent(probeProvider) + "/probe", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keyword }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      $("probe-status").textContent = "";
+      toast(d.error || "探测失败", true);
+      return;
+    }
+    renderProbeResults(d);
+    toast(`探测完成：${(d.ok || []).length} 可用 / ${(d.fail || []).length} 失败（探 ${d.probed}/${d.total}）`);
+  } catch (e) {
+    toast("探测失败: " + e.message, true);
+  } finally {
+    probeBusy = false;
+    btn.disabled = false;
+    btn.textContent = "开始探测";
+    $("probe-status").textContent = "";
+  }
+}
+
+function renderProbeResults(d) {
+  const okRows = (d.ok || []).map(m =>
+    `<label class="probe-row" style="display:flex;gap:8px;align-items:center;padding:2px 0;cursor:pointer"><input type="checkbox" class="probe-ok" value="${esc(m.id)}" checked> <span>${esc(m.id)}</span> <span class="dim">${m.latency_ms}ms</span></label>`).join("");
+  const failRows = (d.fail || []).map(m =>
+    `<div class="probe-row" style="display:flex;gap:8px;align-items:center;padding:2px 0"><span>${esc(m.id)}</span> <span class="dim">${esc(String(m.status))} · ${esc(m.why || "")}</span></div>`).join("");
+  $("probe-results").innerHTML = `
+    <div style="margin-top:10px"><b>可用（${(d.ok || []).length}，默认全选）</b>${okRows || '<div class="dim">无</div>'}</div>
+    <details style="margin-top:10px"><summary style="cursor:pointer"><b>失败（${(d.fail || []).length}）</b></summary>${failRows || '<div class="dim">无</div>'}</details>
+    <div class="modal-btns">
+      <button class="btn primary" onclick="saveProbeModels()">保存勾选模型</button>
+    </div>`;
+}
+
+async function saveProbeModels() {
+  if (!probeProvider) return;
+  const checked = Array.from(document.querySelectorAll(".probe-ok:checked")).map(cb => cb.value);
+  if (!checked.length) { toast("未勾选任何模型", true); return; }
+  try {
+    const r = await api("/api/providers/" + encodeURIComponent(probeProvider) + "/models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ models: checked }),
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      toast(`已保存 ${d.models.length} 个模型到「${d.provider}」（立即生效）`);
+      closeModal("probeModal");
+      loadProvidersInfo();
+    } else {
+      toast(d.error || "保存失败", true);
+    }
+  } catch (e) { toast("保存失败: " + e.message, true); }
+}
+
+// T11-F3: 账号分组标签选择器（POST /api/accounts/<uid>/group，
+// accounts.json 条目 span 文本级编辑，change 即存）
+const GROUP_LABEL = { "": "订阅池", free: "免费组", pro: "专业组" };
+
+async function setAccountGroup(uid, group) {
+  try {
+    const r = await api("/api/accounts/" + encodeURIComponent(uid) + "/group", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group }),
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      toast(`账号 ${uid} 分组已设为「${GROUP_LABEL[group] || group}」`);
+      loadAccounts();
+    } else {
+      toast(d.error || "分组保存失败", true);
+      loadAccounts(); // 回滚下拉显示
+    }
+  } catch (e) { toast("分组保存失败: " + e.message, true); loadAccounts(); }
 }
 
 async function uploadAtomcode(pname) {
