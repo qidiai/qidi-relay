@@ -465,7 +465,13 @@ def _toggle_provider_in_text(text: str, name: str, enabled: bool) -> str:
        调用方据此 500，原文一字不动，绝不半截
     """
     import re
-    json.loads(text)  # 写前全文件校验
+    cfg = json.loads(text)  # 写前全文件校验
+    # N-1：文本手术前确认目标 provider 是对象（病理配置
+    # 确定性拒绝——非 dict 条目直接 ValueError，原文不动）
+    provs = cfg.get("providers") if isinstance(cfg, dict) else None
+    if not isinstance(provs, dict) or not isinstance(provs.get(name), dict):
+        raise ValueError(
+            'providers 节内无 provider「%s」（或条目非对象）' % name)
     m = re.search(r'"providers"\s*:\s*\{', text)
     if not m:
         raise ValueError('config.json 无 "providers" 节')
@@ -818,7 +824,13 @@ def _set_provider_models(name: str, models: list) -> None:
     import shutil
     from proxy_core.settings import CONFIG_FILE
     text = CONFIG_FILE.read_text(encoding="utf-8")
-    json.loads(text)  # 写前全文件校验
+    cfg = json.loads(text)  # 写前全文件校验
+    # N-1：文本手术前确认目标 provider 是对象（病理配置
+    # 确定性拒绝——非 dict 条目直接 ValueError，原文不动）
+    provs = cfg.get("providers") if isinstance(cfg, dict) else None
+    if not isinstance(provs, dict) or not isinstance(provs.get(name), dict):
+        raise ValueError(
+            'providers 节内无 provider「%s」（或条目非对象）' % name)
     m = re.search(r'"providers"\s*:\s*\{', text)
     if not m:
         raise ValueError('config.json 无 "providers" 节')
@@ -918,7 +930,9 @@ def _set_account_group(uid: str, group: str) -> None:
        踪只认本层键）：
        - 有 "group" 成员 → 原地替换其值为新 group
        - 无 → 条目闭括号前插入 "group": <值>（沿用成员
-         缩进；紧凑格式用逗号空格分隔）
+         缩进；逗号补在 head 末尾作前成员与新成员的分
+         隔——新成员是末成员，自身不带尾逗号；紧凑/
+         多行两分支同此）
     4. 写后复读校验：json.loads(new) 成功、目标账号
        group 确为 group、且其余账号逐字段不变
     """
@@ -964,9 +978,14 @@ def _set_account_group(uid: str, group: str) -> None:
             ins = "\n" + member_indent + '"group": ' + val + "\n" + close_indent
             new_text = head + ins + text[close_idx:]
         else:
-            ins = '"group": ' + val + (
-                ", " if not text[:k].rstrip().endswith("{") else "")
-            new_text = text[:k] + ins + text[close_idx:]
+            # 紧凑分支：逗号补在 head 末尾（分隔前成员与
+            # 新成员），ins 不含尾逗号——新成员是末成员，
+            # 尾逗号落在 } 前是 JSON 语法错
+            head = text[:k]
+            if head.rstrip() and not head.rstrip().endswith("{"):
+                head += ","
+            ins = '"group": ' + val
+            new_text = head + ins + text[close_idx:]
     # 写后复读校验：解析成功、目标 group 落地、其余账号不变
     before = _accs(text)
     after = _accs(new_text)

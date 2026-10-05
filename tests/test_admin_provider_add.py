@@ -5,15 +5,20 @@
 - F1 页面添加新渠道：合法插入（块结构正确 + pricing 重复键
   保留 + 块首插入 + 备份）/ name 重复 400 / name 非法字符
   400 / base_url 非 https 400 / key 空 400 / 写后复读校验
-  失败 500 不动原文（mock）
+  失败 500 不动原文（mock）；F1→F2 端到端串联（add 未
+  激活 → probe → 写回 models → all_models 含且 match 命中）
 - F2 一键探测上游可用模型：probe 解析逻辑（models 列表 +
   keyword 过滤 + ok/fail 分类）/ 并发上限与超时行为（mock
   慢响应）/ models 写回替换正确且重复键保留 / provider 不
   存在 404 / 上游 /models 非 200 → 502
+- 病理配置确定性拒绝（N-1）：providers 节内目标非对象
+  （如 y 在前且 y.models 含字符串 "x"）→ 文本手术前
+  ValueError / 端点 404 拒绝，config 逐字节不动
 - F3 账号分组标签：group 三值写入正确 / 非白名单值 400 /
   uid 不存在 404 / span 编辑不碰其他账号（多账号 fixture）/
   写后 accounts.json 可解析且目标账号 group 正确 + 单例热
-  重载 / 无 group 键条目插入分支
+  重载 / 无 group 键条目插入分支 / 紧凑格式（单行与仅
+  user_id 成员）写 group
 
 单例隔离约定：与 test_provider_keys 相同——import routes.admin
 前先把 settings 路径常量指到临时目录，绝不触碰仓库根数据文件。
@@ -269,18 +274,47 @@ def test_add_provider_roundtrip(client):
     # 热生效：models 空初始——provider 在 config 中但按既有
     # "配置不完整（需 base_url/api_keys/models）"纪律暂不激活
     # （与 _load_providers 对无 models provider 的处理一致；
-    # F2 探测填模型后即激活路由）
+    # F1→F2 端到端串联激活见 test_f1_to_f2_end_to_end）
     providers._cache = None
     assert "myrelay" not in providers.all_providers()
-    # F1→F2 串联：填入模型后立即激活、可路由
-    r = c.post("/api/providers/myrelay/models",
-               json={"models": ["myrelay-m1"]})
+
+
+def test_f1_to_f2_end_to_end(client, monkeypatch):
+    """N-6 F1→F2 端到端：add（models 空未激活）→ probe
+    （mock 上游）→ 探测结果写回 models → 模型进
+    all_models 且 match 命中新 provider（单用例闭环，
+    替代 roundtrip 尾部与 probe 用例的两段拼合）。"""
+    c, cfg_file, _ = client
+    # F1：页面添加新渠道（models 空初始 → 暂不激活）
+    r = c.post("/api/providers/add", json={
+        "name": "newchan",
+        "base_url": "https://api.newchan.example/v1",
+        "api_key": "sk-new-chan-key"})
     assert r.status_code == 200, r.get_data(as_text=True)
     providers._cache = None
-    provs = providers.all_providers()
-    assert provs["myrelay"]["enabled"] is True
-    assert provs["myrelay"]["keys"][0]["key"] == "sk-new-relay-key"
-    assert provs["myrelay"]["models"] == ["myrelay-m1"]
+    assert "newchan" not in providers.all_providers()
+    assert "新渠道模型" not in [m["id"] for m in providers.all_models()]
+    # F2：一键探测上游可用模型（mock 上游 /models + chat）
+    _ProbeFakeClient._reset(
+        models_payload={"data": [{"id": "新渠道模型"}, {"id": "other"}]})
+    monkeypatch.setattr(admin_mod.httpx, "Client", _ProbeFakeClient)
+    r = c.post("/api/providers/newchan/probe", json={"keyword": "新渠道"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    d = r.get_json()
+    assert d["total"] == 1 and d["probed"] == 1
+    assert [m["id"] for m in d["ok"]] == ["新渠道模型"]
+    assert d["fail"] == []
+    # F2 收尾：把探测到的模型写回 provider 配置
+    r = c.post("/api/providers/newchan/models",
+               json={"models": [m["id"] for m in d["ok"]]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # 端到端闭环：模型进 all_models，match 命中新 provider
+    providers._cache = None
+    assert "新渠道模型" in [m["id"] for m in providers.all_models()]
+    hit = providers.match("新渠道模型")
+    assert hit is not None
+    assert hit["name"] == "newchan"
+    assert hit["enabled"] is True
 
 
 def test_add_provider_duplicate_name_400(client):
@@ -466,6 +500,47 @@ def test_probe_provider_not_found_404(client):
                   json={"models": ["m"]}).status_code == 404
 
 
+# ─── 病理配置确定性拒绝（N-1）──────────────────────────────
+
+def test_toggle_provider_non_dict_entry_rejected(client):
+    """N-1 病理配置：provider「y」在前且 y.models 含字符串
+    "x"（providers 节内无「x」条目）——切 x 的开关 / 写 x
+    的 models 在文本手术前确定性 ValueError，端点 404 拒绝，
+    config.json 逐字节不动。"""
+    c, cfg_file, _ = client
+    cfg = {
+        "admin_password": None,
+        "providers": {
+            "y": {
+                "base_url": "https://y.example/v1",
+                "api_keys": ["sk-y"],
+                "models": ["x"],
+            },
+            "z": {
+                "base_url": "https://z.example/v1",
+                "api_keys": ["sk-z"],
+                "models": ["z-1"],
+            },
+        },
+    }
+    cfg_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    providers._cache = None
+    before = _cfg_text(cfg_file)
+    # helper 层：文本手术前确定性 ValueError（直接调用）
+    with pytest.raises(ValueError):
+        admin_mod._toggle_provider_in_text(before, "x", False)
+    with pytest.raises(ValueError):
+        admin_mod._set_provider_models("x", ["m-1"])
+    # 端点层：确定性拒绝（既有 404 前置校验先于 helper 到达）
+    r = c.post("/api/providers/x/enabled", json={"enabled": False})
+    assert r.status_code == 404
+    r = c.post("/api/providers/x/models", json={"models": ["m-1"]})
+    assert r.status_code == 404
+    # 原文逐字节不动
+    assert _cfg_text(cfg_file) == before
+
+
 # ─── F3：账号分组标签选择器 ────────────────────────────────────────
 
 def test_account_group_three_values(client):
@@ -563,3 +638,61 @@ def test_account_group_insert_when_key_missing(client):
     seg = text[i:j]
     assert '"group": "free"' in seg
     assert text.count('"group": "free"') == 1
+
+
+def _restore_am_pool(acct_file):
+    """还原共享单例 am 的标准账号池（N-2 紧凑格式用例的
+    条目缺 token / 缺字段，AccountManager._load 会跳过
+    或变形——恢复 9001-9003 标准池，防污染后续测试
+    文件的单例契约）。"""
+    acct_file.write_text(json.dumps({"accounts": [
+        {"user_id": uid, "username": f"t{uid}", "org_id": "0",
+         "access_token": "a.b.c", "enabled": True,
+         "has_glm53": False, "budget_exceeded": False,
+         "group": ""} for uid in ("9001", "9002", "9003")]},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    am._load()
+
+
+def test_account_group_compact_single_line(client):
+    """N-2 紧凑格式（单行 accounts.json）写 group：逗号
+    补在 head 末尾分隔前成员与新成员——JSON 合法（无尾
+    逗号）、目标落地、其余账号逐字段不变。"""
+    c, _, acct_file = client
+    # 紧凑格式：整文件一行、条目内无 group 键
+    acct_file.write_text(json.dumps({"accounts": [
+        {"user_id": "9001", "access_token": "a.b.c"},
+        {"user_id": "9002", "access_token": "d.e.f"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    r = c.post("/api/accounts/9001/group", json={"group": "free"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # 精确文本断言：逗号在 head 末尾、新成员无尾逗号
+    assert _acct_text(acct_file) == (
+        '{"accounts": [{"user_id": "9001", "access_token": "a.b.c",'
+        '"group": "free"}, {"user_id": "9002", "access_token": "d.e.f"}]}'
+    )
+    # JSON 合法且目标 group 落地
+    accts = _acct_of(acct_file)["accounts"]
+    assert next(a for a in accts if a["user_id"] == "9001")["group"] == "free"
+    # 其余账号逐字段不变
+    assert next(
+        a for a in accts if a["user_id"] == "9002") == {
+            "user_id": "9002", "access_token": "d.e.f"}
+    _restore_am_pool(acct_file)
+
+
+def test_account_group_compact_user_id_only_entry(client):
+    """N-2 紧凑格式条目只有 user_id 一个成员 → 写 group
+    成功（head 以引号结尾仍正确补逗号分隔）。"""
+    c, _, acct_file = client
+    acct_file.write_text('[{"user_id": "9001"}]', encoding="utf-8")
+    r = c.post("/api/accounts/9001/group", json={"group": "free"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # JSON 合法（无尾逗号）且 group 落地
+    # （紧凑 fixture 是裸数组形态——端点与
+    # AccountManager._load 均支持）
+    text = _acct_text(acct_file)
+    assert text == '[{"user_id": "9001","group": "free"}]'
+    accts = _acct_of(acct_file)
+    assert next(a for a in accts if a["user_id"] == "9001")["group"] == "free"
+    _restore_am_pool(acct_file)
