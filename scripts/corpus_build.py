@@ -67,13 +67,39 @@ def _log(msg: str) -> None:
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
 
 
+def _assistant_text(sample: dict) -> str:
+    """assistant 可见文本——三级 fallback，
+    取第一个非空：
+    ① 顶层 assistant.content（本地采集
+    schema，T7 落盘形态）；
+    ② 顶层 response（云端拉取 schema：
+    答案在顶层 response，可能是 str 也
+    可能是 dict——dict 取 content 字段，
+    统一经 _to_text 归一）；
+    ③ messages 内最后一条 role=assistant
+    的 content。"""
+    asst = sample.get("assistant") or {}
+    content = asst.get("content") or ""
+    if content:
+        return _to_text(content)
+    resp = sample.get("response")
+    if isinstance(resp, dict):
+        resp = resp.get("content")
+    if resp:
+        return _to_text(resp)
+    last = ""
+    for m in sample.get("messages") or []:
+        if (isinstance(m, dict)
+                and m.get("role") == "assistant"):
+            last = m.get("content") or ""
+    return _to_text(last)
+
+
 def _assistant_chars(sample: dict) -> int:
     """assistant 可见文本长度（thinking 不计入——
     短样本判据是"有效回复"长度，工具确认/ack 类
     短样本 thinking 无关）。"""
-    asst = sample.get("assistant") or {}
-    content = asst.get("content") or ""
-    return len(content)
+    return len(_assistant_text(sample))
 
 
 def _dedup_key(sample: dict) -> str:
@@ -107,16 +133,31 @@ def _sft_messages(sample: dict, include_thinking: bool) -> list:
             continue
         out.append({"role": m.get("role"),
                     "content": _to_text(m.get("content"))})
-    asst = sample.get("assistant") or {}
-    content = _to_text(asst.get("content"))
-    thinking = asst.get("thinking") or ""
-    if include_thinking and thinking:
-        content = thinking + "\n\n" + content
-    msg = {"role": "assistant", "content": content}
-    tool_calls = asst.get("tool_calls") or []
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
-    out.append(msg)
+    if "assistant" in sample:
+        # 本地采集样本：照旧用顶层 assistant
+        # 段收尾（thinking 开关逻辑不变）
+        asst = sample.get("assistant") or {}
+        content = _to_text(asst.get("content"))
+        thinking = asst.get("thinking") or ""
+        if include_thinking and thinking:
+            content = thinking + "\n\n" + content
+        msg = {"role": "assistant", "content": content}
+        tool_calls = asst.get("tool_calls") or []
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        out.append(msg)
+        return out
+    # 云端拉取样本（无顶层 assistant 键）：
+    # 同链 fallback 文本作收尾 assistant——
+    # 云端 messages 末条常是 tool，append
+    # 收尾正好补齐 SFT 形状；若 messages
+    # 末条已是 assistant 且内容与收尾文本
+    # 相同则不重复 append
+    content = _assistant_text(sample)
+    if (out and out[-1].get("role") == "assistant"
+            and out[-1].get("content") == content):
+        return out
+    out.append({"role": "assistant", "content": content})
     return out
 
 

@@ -11,6 +11,16 @@ R6 项目9 修复点同步验收：
 - manifest 增 dedup_note（如实披露：去重键
   仅 messages，同 prompt 异回复并留首见）。
 
+R9 云端样本 schema 兼容（实证 bug 修复）：
+- 云端拉取样本答案在顶层 response（无顶层
+  assistant 键，messages 末条常是 tool）→
+  _assistant_chars 三级 fallback（① assistant
+  .content → ② response[str|dict，dict 取
+  content 字段] → ③ messages 末条 assistant）
+  + _sft_messages 云端收尾 assistant 由
+  response 文本补齐（末条已是 assistant 且
+  内容相同则不重复 append）。
+
 纯 TMP 目录零仓库数据文件；脚本经 importlib
 按路径加载（scripts/ 非包）。
 
@@ -304,3 +314,214 @@ def test_sft_shape(tmp_path):
     rec2 = _all_recs(out2)[0]
     assert rec2["messages"][1]["content"].startswith(
         "思考过程\n\n")
+# ─── 8. 云端样本 schema 兼容（R9）────────
+
+CLOUD_RESP = "这是云端回复的足够长文本内容用于通过阈值"
+
+
+def _cloud_sample(session_id, user_q, response, *,
+                  model="GLM-5.3"):
+    """云端拉取样本真实 schema（实证）：顶层
+    id（整数）/messages/response/model/ts/
+    tool_calls——答案在顶层 response，无顶层
+    assistant 键，messages 为 assistant/tool
+    交错历史、末条常是 tool。"""
+    return {
+        "id": 7161001,
+        "messages": [
+            {"role": "user", "content": user_q},
+            {"role": "assistant",
+             "content": "我需要先查询再回答",
+             "tool_calls": [{
+                 "id": "call_1",
+                 "type": "function",
+                 "function": {
+                     "name": "lookup",
+                     "arguments": "{}"}}]},
+            {"role": "tool",
+             "content": "查询结果：……"},
+        ],
+        "response": response,
+        "model": model,
+        "ts": "2026-09-15T00:00:00",
+        "tool_calls": [],
+        "session_id": session_id,
+        "usage": {"prompt": 3, "completion": 5,
+                  "total": 8},
+    }
+
+
+def _write_cloud(corpus: pathlib.Path,
+                 samples: list) -> None:
+    """云端样本写 corpus_202610.jsonl。"""
+    corpus.mkdir(parents=True, exist_ok=True)
+    (corpus / "corpus_202610.jsonl").write_text(
+        "\n".join(json.dumps(s, ensure_ascii=False)
+                  for s in samples) + "\n",
+        encoding="utf-8")
+
+
+def test_cloud_sample_passes_filter_into_train(
+        tmp_path):
+    # 云端样本（答案在顶层 response）：修复前
+    # _assistant_chars 只读 assistant.content
+    # → 恒 0 → 全部被短样本过滤（实证
+    # 7040→0）；修复后按 response 长度过
+    # 16 字符阈值进 train（5 组会话→
+    # train 4 / val 1）
+    corpus = tmp_path / "corpus_local"
+    _write_cloud(corpus, [
+        _cloud_sample("cs-%d" % i, "云端问题%d" % i,
+                      CLOUD_RESP + suffix)
+        for i, suffix in enumerate(["", "二",
+                                    "三", "四",
+                                    "五"])])
+    out = tmp_path / "out"
+    m = CB.build(corpus, out)
+    assert m["input"] == 5
+    assert m["short_count"] == 0
+    assert m["short_filtered"] == 0
+    assert m["train"] == 4
+    assert m["val"] == 1
+    assert _count_lines(out / "train.jsonl") == 4
+
+
+def test_cloud_train_closing_assistant_is_response(
+        tmp_path):
+    # 云端 train 记录：收尾 assistant =
+    # response 文本；messages 末条常是
+    # tool，append assistant 收尾正好补齐
+    # SFT 形状（roles 以 tool→assistant
+    # 收尾）
+    corpus = tmp_path / "corpus_local"
+    resp_map = {
+        "云端问题甲": CLOUD_RESP,
+        "云端问题乙": CLOUD_RESP + "乙",
+    }
+    _write_cloud(corpus, [
+        _cloud_sample("cs-甲", "云端问题甲",
+                      resp_map["云端问题甲"]),
+        _cloud_sample("cs-乙", "云端问题乙",
+                      resp_map["云端问题乙"])])
+    out = tmp_path / "out"
+    m = CB.build(corpus, out)
+    assert m["train"] == 1
+    rec = json.loads(
+        (out / "train.jsonl").read_text(
+            encoding="utf-8").splitlines()[0])
+    roles = [mm["role"] for mm in rec["messages"]]
+    assert roles == ["user", "assistant",
+                     "tool", "assistant"]
+    q = rec["messages"][0]["content"]
+    assert rec["messages"][-1]["content"] ==         resp_map[q]
+
+
+def test_cloud_response_dict_form(tmp_path):
+    # response 可能是 dict——取 content 字段
+    # （经 _to_text 归一）后同样过滤+收尾
+    corpus = tmp_path / "corpus_local"
+    _write_cloud(corpus, [
+        _cloud_sample("cs-甲", "云端问题甲",
+                      {"content": CLOUD_RESP}),
+        _cloud_sample("cs-乙", "云端问题乙",
+                      {"content": CLOUD_RESP + "乙"})])
+    out = tmp_path / "out"
+    m = CB.build(corpus, out)
+    assert m["short_count"] == 0
+    assert m["train"] == 1
+    rec = json.loads(
+        (out / "train.jsonl").read_text(
+            encoding="utf-8").splitlines()[0])
+    assert rec["messages"][-1]["content"] in (
+        CLOUD_RESP, CLOUD_RESP + "乙")
+
+
+def test_cloud_last_assistant_same_as_response_no_dup(
+        tmp_path):
+    # messages 末条已是 assistant 且内容与
+    # response 相同 → 不重复 append 收尾
+    corpus = tmp_path / "corpus_local"
+    s = _cloud_sample("cs1", "云端问题一",
+                      CLOUD_RESP)
+    s["messages"] = [
+        {"role": "user", "content": "云端问题一"},
+        {"role": "assistant", "content": CLOUD_RESP}]
+    _write_cloud(corpus, [s])
+    out = tmp_path / "out"
+    CB.build(corpus, out)
+    rec = _all_recs(out)[0]
+    roles = [mm["role"] for mm in rec["messages"]]
+    assert roles == ["user", "assistant"]
+    assert rec["messages"][-1]["content"] ==         CLOUD_RESP
+
+
+def test_local_format_no_regression(tmp_path):
+    # 本地采集样本（顶层 assistant 段）照旧：
+    # 收尾内容取 assistant.content，thinking
+    # 开关逻辑不变（R9 不动本地路径）
+    corpus = tmp_path / "corpus_local"
+    s = _sample("s1", "问题一")
+    s["assistant"]["thinking"] = "思考过程"
+    _write(corpus, [s])
+    out = tmp_path / "out"
+    CB.build(corpus, out)
+    rec = _all_recs(out)[0]
+    roles = [mm["role"] for mm in rec["messages"]]
+    assert roles == ["user", "assistant"]
+    assert rec["messages"][-1]["content"] ==         "这是足够长的回复内容用于通过短样本阈值"
+    assert "思考过程" not in json.dumps(
+        rec, ensure_ascii=False)
+    out2 = tmp_path / "out2"
+    CB.build(corpus, out2, include_thinking=True)
+    rec2 = _all_recs(out2)[0]
+    assert rec2["messages"][-1][
+        "content"].startswith("思考过程\n\n")
+
+
+def test_mixed_sources_by_source_counts(tmp_path):
+    # 混合双源构建：by_source 按 id 形态计数
+    # （整数 id=cloud / 其他=local）；云端
+    # model 取顶层 model 字段入 by_model
+    corpus = tmp_path / "corpus_local"
+    _write(corpus, [
+        _sample("s1", "本地问题一"),
+        _sample("s2", "本地问题二")])
+    _write_cloud(corpus, [
+        _cloud_sample("cs1", "云端问题一",
+                      CLOUD_RESP),
+        _cloud_sample("cs2", "云端问题二",
+                      CLOUD_RESP + "二"),
+        _cloud_sample("cs3", "云端问题三",
+                      CLOUD_RESP + "三")])
+    out = tmp_path / "out"
+    m = CB.build(corpus, out)
+    assert m["input"] == 5
+    assert m["by_source"]["local"]["count"] == 2
+    assert m["by_source"]["cloud"]["count"] == 3
+    assert m["by_source"]["local"]["tokens"] == 16
+    assert m["by_source"]["cloud"]["tokens"] == 24
+    assert m["by_model"]["GLM-5.3"]["count"] == 5
+    assert m["train"] + m["val"] == 5
+
+
+def test_assistant_chars_third_fallback(tmp_path):
+    # 三级 fallback 末级：无 assistant 段、
+    # 无顶层 response → 取 messages 内最后
+    # 一条 role=assistant 的 content 长度；
+    # 收尾时末条已是 assistant 且内容相同
+    # → 不重复 append
+    corpus = tmp_path / "corpus_local"
+    s = _cloud_sample("cs1", "云端问题一", "")
+    s["messages"].append({
+        "role": "assistant",
+        "content": "末条助理回复内容足够长可以通过阈值"})
+    _write_cloud(corpus, [s])
+    assert CB._assistant_chars(s) == len(
+        "末条助理回复内容足够长可以通过阈值")
+    out = tmp_path / "out"
+    CB.build(corpus, out)
+    rec = _all_recs(out)[0]
+    roles = [mm["role"] for mm in rec["messages"]]
+    assert roles == ["user", "assistant",
+                     "tool", "assistant"]
+    assert rec["messages"][-1]["content"] ==         "末条助理回复内容足够长可以通过阈值"
