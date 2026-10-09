@@ -695,6 +695,201 @@ def api_provider_add():
     return jsonify({"provider": name, "base_url": base_url, "enabled": enabled})
 
 
+# ─── Provider 渠道删除（F6）──────────────────────────────────
+# 面板「删除渠道」：providers 节整块移除（渠道配置与
+# 全部 key 一并消失，模型即刻从路由消失）。文本级结构
+# 保留式（与 T10/F1 同纪律：pricing 节大小写折叠重复
+# 键不因回写丢失），删块时按首/中/末/唯一成员四种
+# 位置正确处理配套逗号。
+# 删除边界（比云端更严）：仅静态 key 型渠道可删——
+# 带 type 字段的渠道（atomcode/cline/minicode 等本
+# 地工具型通道）一律 400 拒绝，防误删核心通道。
+
+
+def _find_member_block(text: str, sec_open: int, sec_end: int, name: str):
+    """在 [sec_open, sec_end] 节内深度感知扫描直辖成员
+    "name": {。跳过字符串字面量（_comment 等文本内容里
+    的假锚点天然免疫），只认本层（depth==0）键；遇嵌套
+    同名键继续扫描。返回 (member_start, block_end)——
+    member_start 是成员键的开引号下标（删除时从此处
+    连键带块一起删），block_end 是块闭括号下标；
+    未找到返回 None。"""
+    i = sec_open + 1
+    depth = 0
+    while i < sec_end:
+        ch = text[i]
+        if ch == '"':
+            j = i + 1
+            while j < sec_end:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            if depth == 0:
+                # 本层键：命中目标且值为对象 → 成员块定位
+                k = j + 1
+                while k < sec_end and text[k] in " \t\r\n":
+                    k += 1
+                if (k < sec_end and text[k] == ":"
+                        and json.loads(text[i:j + 1]) == name):
+                    v = k + 1
+                    while v < sec_end and text[v] in " \t\r\n":
+                        v += 1
+                    if v < sec_end and text[v] == "{":
+                        return (i, _brace_match(text, v))
+                    # 直辖成员值非对象（病理配置）：跳过继续扫
+                    i = k
+                    continue
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return None
+
+
+def _remove_provider_in_text(text: str, name: str) -> str:
+    """文本级结构保留式改写 config.json 全文：从 providers
+    节整体删除 name 成员块（含配套逗号）。算法：
+
+    1. 写前全文件 json.loads 校验（坏文件直接拒绝，不落盘）
+    2. N-1 前置校验：目标 provider 是对象（病理配置
+       确定性拒绝——非 dict 条目直接 ValueError，原文不动）
+    3. 定位 "providers" 节（首次出现 "providers": {，
+       花括号配对得节界）
+    4. 节内深度感知扫描定位直辖成员块
+       （_find_member_block：跳过字符串字面量与嵌套同名键）
+    5. 删块 + 配套逗号，三种位置语义统一：
+       - 块后有逗号（首/中间成员）：删块至尾逗号（含），
+         再吞其后空白——前后成员以原空白衔接
+       - 块前有逗号（末成员，无尾逗号）：删前导逗号
+         （含）至块尾——前成员直接衔接节闭括号前空白
+       - 无逗号（唯一成员）：删块；节内仅剩空白 → 清空 {}
+    6. 写后复读校验：json.loads(new) 成功、providers 节
+       目标确已消失、其余 provider 节点逐字段不变、顶层
+       其他键不变——任一失败抛 ValueError，原文一字不动
+    """
+    import re
+    cfg = json.loads(text)  # 写前全文件校验
+    # N-1：文本手术前确认目标 provider 是对象（病理配置
+    # 确定性拒绝——非 dict 条目直接 ValueError，原文不动）
+    provs = cfg.get("providers") if isinstance(cfg, dict) else None
+    if not isinstance(provs, dict) or not isinstance(provs.get(name), dict):
+        raise ValueError(
+            'providers 节内无 provider「%s」（或条目非对象）' % name)
+    m = re.search(r'"providers"\s*:\s*\{', text)
+    if not m:
+        raise ValueError('config.json 无 "providers" 节')
+    sec_open = m.end() - 1
+    sec_end = _brace_match(text, sec_open)
+    blk = _find_member_block(text, sec_open, sec_end, name)
+    if blk is None:
+        raise ValueError('providers 节内无 provider「%s」' % name)
+    member_open, block_end = blk
+    # 尾逗号分支：块后跳过空白若是逗号 → 删块至尾逗号
+    k = block_end + 1
+    while k < sec_end and text[k] in " \t\r\n":
+        k += 1
+    if k < sec_end and text[k] == ",":
+        e = k + 1  # 吞掉逗号后空白，衔接下一成员
+        while e < sec_end and text[e] in " \t\r\n":
+            e += 1
+        new_text = text[:member_open] + text[e:]
+    else:
+        # 前导逗号分支：块前跳过空白若是逗号 → 删逗号至块尾
+        b = member_open - 1
+        while b > sec_open and text[b] in " \t\r\n":
+            b -= 1
+        if b > sec_open and text[b] == ",":
+            new_text = text[:b] + text[block_end + 1:]
+        else:
+            # 唯一成员：删块；节内仅剩空白时清空为 {}
+            inner = text[sec_open + 1:member_open] + text[block_end + 1:sec_end]
+            if not inner.strip():
+                new_text = text[:sec_open + 1] + text[sec_end:]
+            else:
+                new_text = text[:member_open] + text[block_end + 1:]
+    # 写后复读校验：解析成功、目标确已消失、其余节点逐字段不变
+    check = json.loads(new_text)
+    cprovs = check.get("providers")
+    if not isinstance(cprovs, dict) or name in cprovs:
+        raise ValueError("复读校验失败：providers.%s 未正确移除" % name)
+    if len(cprovs) != len(provs) - 1:
+        raise ValueError("复读校验失败：providers 节成员数异常")
+    for k2, v2 in provs.items():
+        if k2 == name:
+            continue
+        if cprovs.get(k2) != v2:
+            raise ValueError("复读校验失败：providers.%s 被改动" % k2)
+    for k2, v2 in cfg.items():
+        if k2 == "providers":
+            continue
+        if check.get(k2) != v2:
+            raise ValueError("复读校验失败：顶层键 %s 被改动" % k2)
+    return new_text
+
+
+def _set_provider_remove(name: str) -> None:
+    """provider 块整体移除落盘：文本级改写 + 备份 + 原子写（避免半程写坏）。"""
+    import shutil
+    from proxy_core.settings import CONFIG_FILE
+    new_text = _remove_provider_in_text(
+        CONFIG_FILE.read_text(encoding="utf-8"), name)
+    bak = CONFIG_FILE.with_name(
+        f"{CONFIG_FILE.name}.bak-provdel-{time.strftime('%m%d-%H%M%S')}")
+    shutil.copy2(CONFIG_FILE, bak)
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, CONFIG_FILE)
+
+
+@bp.route("/providers/<name>/remove", methods=["POST"])
+@check_admin_auth
+def api_provider_remove(name):
+    """面板「删除渠道」：从 config.json providers 节整体
+    移除一个 provider（渠道配置与全部 key 一并消失，
+    热生效）。
+
+    name 不存在 404；带 type 字段的特殊通道（atomcode/
+    cline/minicode 等本地工具型）400 拒绝——仅静态
+    key 型渠道支持面板删除（防误删核心通道）。写
+    config.json 用文本级结构保留式（pricing 大小写折叠
+    重复键不因回写丢失），删前备份
+    config.json.bak-provdel-MMDD-HHMMSS 可恢复。响应
+    key_count 为删除前统计（_parse_keys 归一化口径，
+    与 key 清单同口径），给用户确认参考。
+    """
+    name = str(name or "").strip()
+    provs = load_config().get("providers") or {}
+    p = provs.get(name)
+    if not isinstance(p, dict):
+        return jsonify({"error": f"provider「{name}」不存在"}), 404
+    if "type" in p:
+        ptype = p.get("type")
+        kind = {"atomcode": "AtomCode 签名", "cline": "Cline 官方",
+                "minicode": "MiniCode（mcode）官方"}.get(ptype, f"type={ptype}")
+        return jsonify({"error": f"provider「{name}」是{kind}通道，"
+                        f"仅静态 key 型渠道支持面板删除"}), 400
+    # 删除前统计 key 数（给用户确认参考）
+    key_count = len(providers._parse_keys(name, p))
+    try:
+        _set_provider_remove(name)
+    except (ValueError, OSError) as e:
+        log.error("provider「%s」删除写盘失败: %s", name, e)
+        return jsonify({"error": f"写 config.json 失败: {e}"}), 500
+    providers.all_providers()  # 立即触发重载（mtime 热生效）
+    _provider_cache.update(ts=0, data=None)  # 击穿面板缓存，卡片即时消失
+    activity.add("info",
+                 f"Provider「{name}」已删除（{key_count} 个 key 一并移除）",
+                 model=name)
+    return jsonify({"provider": name, "key_count": key_count})
+
+
 # ─── 一键探测上游可用模型（F2）────────────────────────────────
 # 卡片「探测模型」：GET {base_url}/models（带第一个 key）
 # 拿候选 → keyword 子串过滤（大小写不敏感）→ 最多探 40

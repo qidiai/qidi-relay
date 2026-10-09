@@ -753,6 +753,7 @@ function renderProviderCard(p) {
     <div class="acc-actions">
       <button class="btn tiny" onclick="probeModels('${esc(p.name)}')" title="一键探测上游可用模型（GET /models + 1-token 并发探活，最多 40 个/并发 4/单次 20s 超时）">探测模型</button>
       <button class="btn tiny ${p.enabled === false ? "primary" : "danger"}" onclick="toggleProvider('${esc(p.name)}', ${p.enabled === false})">${p.enabled === false ? "启用" : "停用"}</button>
+      ${(p.atomcode || p.cline || p.minicode) ? "" : `<button class="btn tiny danger ghost" onclick="removeProvider('${esc(p.name)}')" title="删除整个渠道：config.json providers 节整块移除（本机留有备份可恢复），模型即刻从路由消失">删除</button>`}
     </div>
     ${p.ok ? "" : `<div class="acc-meta"><span class="dim">${esc(p.error || "连接失败")}</span></div>`}
   </div>`;
@@ -775,6 +776,29 @@ async function toggleProvider(pname, enabled) {
       toast(d.error || "操作失败", true);
     }
   } catch (e) { toast("操作失败: " + e.message, true); }
+}
+
+// F6: Provider 渠道删除（POST /api/providers/<name>/remove，
+// 服务端文本级结构保留式删 config.json providers 节整块，
+// 备份 config.json.bak-provdel-* 可恢复，热生效；
+// 仅静态 key 型渠道可删（atomcode/cline/minicode 通道无按钮））
+async function removeProvider(pname) {
+  if (!confirm(`确认删除 Provider「${pname}」？`)) return;
+  if (!confirm(`渠道配置与全部 key 将从 config.json 移除（本机留有备份可恢复），模型即刻从路由消失。确认继续？`)) return;
+  try {
+    const r = await api("/api/providers/" + encodeURIComponent(pname) + "/remove", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      toast(`Provider「${d.provider}」已删除（${d.key_count} 个 key 一并移除）`);
+    } else {
+      toast(d.error || "删除失败", true);
+    }
+  } catch (e) {
+    toast("删除失败: " + e.message, true);
+  }
+  loadProvidersInfo();
 }
 
 // T11-F1: 页面添加新渠道（POST /api/providers/add，
