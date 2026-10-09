@@ -54,6 +54,23 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from proxy_core import settings as S  # noqa: E402
+from proxy_core import redact as _redact  # noqa: E402
+
+
+def _load_redact_extra():
+    """config.json corpus.redact_extra → 编译规则列表。
+
+    构建期兜底脱敏第二道保险：即使语料文件在落盘前
+    没被 scrub（历史遗留/手工放置），构建 train/val
+    时也会再过一遍 redact。"""
+    try:
+        cfg = json.loads(
+            (ROOT / "config.json").read_text(encoding="utf-8"))
+        return _redact.parse_extra_rules(
+            (cfg.get("corpus") or {}).get("redact_extra"))
+    except Exception:
+        return []
+
 
 # 固定洗牌种子（可复现 train/val 切分）
 DEFAULT_SEED = 20261003
@@ -196,6 +213,8 @@ def build(corpus_dir: Path, out_dir: Path, *,
         + [p for p in corpus_dir.glob("corpus_*.jsonl")])
     samples = []
     bad_lines = 0
+    extra = _load_redact_extra()
+    scrub_hits = 0
     for path in files:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -203,10 +222,16 @@ def build(corpus_dir: Path, out_dir: Path, *,
                 if not line:
                     continue
                 try:
-                    samples.append(json.loads(line))
+                    obj = json.loads(line)
                 except ValueError:
                     bad_lines += 1
+                    continue
+                obj, _h = _redact.redact_messages(obj, extra)
+                scrub_hits += _h
+                samples.append(obj)
     input_count = len(samples)
+    _log("build scrub: %d secret hits redacted (extra_rules=%d)"
+         % (scrub_hits, len(extra)))
     _log("读 %d 个语料文件、%d 条样本（坏行 %d）"
          % (len(files), input_count, bad_lines))
 
@@ -330,6 +355,7 @@ def build(corpus_dir: Path, out_dir: Path, *,
         "short_count": short_count,
         "short_filtered": short_filtered,
         "bad_lines": bad_lines,
+        "redact_scrub_hits": scrub_hits,
         "train": len(train),
         "val": len(val),
         # token 量

@@ -31,9 +31,11 @@
   redact_messages(messages, extra=None) -> (messages, hits)
 """
 
+import json
 import re
 
 __all__ = ["MASK", "redact_text", "redact_messages",
+           "redact_jsonl_line",
            "parse_extra_rules", "is_sensitive_key"]
 
 # 抹除占位符（全部规则共用）
@@ -44,7 +46,8 @@ MASK = "[REDACTED]"
 # 选择——8899 实测无合法短前缀 token 会被误伤）。
 _TOKEN_RE = re.compile(
     r"\b("
-    r"sk-[A-Za-z0-9_-]{20,}"
+    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"|sk-[A-Za-z0-9_-]{20,}"
     r"|gh[pousr]_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|glpat-[A-Za-z0-9_-]{20,}"
@@ -148,6 +151,11 @@ _POSIX_ABS_PATH_RE = re.compile(
 _SENSITIVE_KEY_EXACT = frozenset({
     "password", "api_key", "access_token",
     "client_secret", "secret", "token",
+    # 2026-10-09 hardening: JWT 三段式走 _TOKEN_RE；
+    # 补齐本仓实际出现过的敏感命名（审计报告 E-1）
+    "authorization", "cookie", "apikey",
+    "secret_key", "private_key",
+    "master_key", "master_key_hex",
 })
 _SENSITIVE_KEY_ANYWHERE = frozenset(
     {"password", "secret", "credential"})
@@ -316,3 +324,25 @@ def redact_messages(messages, extra=None):
     if isinstance(messages, str):
         return redact_text(messages, extra)
     return messages, 0
+
+
+def redact_jsonl_line(line, extra=None):
+    """JSONL 行级兜底脱敏（corpus_pull / corpus_build 用）。
+
+    - 合法 JSON 行 → json.loads 后走 redact_messages
+      （键名结构化探测 + 递归文本），再 ensure_ascii=False
+      回写——保证输出仍是合法 JSONL；
+    - 非 JSON 行 → 整行按纯文本走 redact_text 兜底；
+    - 序列化失败（极端类型）→ 同样回退纯文本。
+    返回 (脱敏后行, 命中数)。"""
+    if not isinstance(line, str) or not line.strip():
+        return line, 0
+    try:
+        obj = json.loads(line)
+    except (ValueError, TypeError):
+        return redact_text(line, extra)
+    out, hits = redact_messages(obj, extra)
+    try:
+        return json.dumps(out, ensure_ascii=False), hits
+    except (TypeError, ValueError):
+        return redact_text(line, extra)

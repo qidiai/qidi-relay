@@ -485,3 +485,52 @@ def test_18_sensitive_key_boundary_positive():
     assert hits == 5
     for v in out.values():
         assert v == R.MASK
+
+
+# ─── 2026-10-09 publish hardening：JWT 三段式 / 扩展字段名 / jsonl 兜底 ───
+
+def test_jwt_three_part_redacted():
+    jwt = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+           "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+           "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c")
+    s = "Bearer " + jwt + " done"
+    out, hits = R.redact_text(s)
+    assert hits == 1
+    assert jwt not in out
+    assert R.MASK in out
+
+
+def test_jwt_fragment_not_redacted():
+    # 无三段结构的 eyJ 串（普通 base64 片段）不误伤
+    s = "payload eyJhbGciOiJIUzI1NiJ9 tail"
+    out, hits = R.redact_text(s)
+    assert hits == 0
+    assert "eyJhbGciOiJIUzI1NiJ9" in out
+
+
+def test_sensitive_key_extended_names():
+    for k in ("authorization", "cookie", "apikey",
+              "secret_key", "private_key",
+              "master_key", "master_key_hex"):
+        assert R.is_sensitive_key(k), k
+    # 邻近但非敏感命名不误伤
+    assert not R.is_sensitive_key("keyboard")
+    assert not R.is_sensitive_key("key_count")
+
+
+def test_jsonl_line_structured_and_text():
+    import json
+    line = ('{"msg":"tok eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig123456789",'
+            '"access_token":"abc"}')
+    out, hits = R.redact_jsonl_line(line)
+    obj = json.loads(out)                    # 仍是合法 JSON
+    assert obj["access_token"] == R.MASK     # 字段名探测
+    assert "eyJ" not in obj["msg"]           # JWT 文本级
+    assert hits >= 2
+
+
+def test_jsonl_line_nonjson_fallback():
+    line = "raw line with sk-abcdefghijklmnopqrstuvwxyz1234 inside"
+    out, hits = R.redact_jsonl_line(line)
+    assert hits == 1
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in out

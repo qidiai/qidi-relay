@@ -13,6 +13,25 @@ import requests
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_DIR = os.path.join(BASE_DIR, "corpus_local")
+
+# ── 本地兜底脱敏（2026-10-09）：云端导出可能漏机密，
+# 落盘前统一过 proxy_core.redact（JWT/平台 token/字段名/
+# corpus.redact_extra 自定义词）——双保险第二道。
+sys.path.insert(0, BASE_DIR)
+from proxy_core import redact as _redact  # noqa: E402
+
+
+def _load_extra():
+    """config.json corpus.redact_extra → 编译规则列表"""
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"),
+                  encoding="utf-8") as f:
+            cfg = json.load(f)
+        return _redact.parse_extra_rules(
+            (cfg.get("corpus") or {}).get("redact_extra"))
+    except Exception:
+        return []
+
 STATE = os.path.join(BASE_DIR, "corpus_state.json")
 LOG = os.path.join(BASE_DIR, "corpus_pull.log")
 URL = "https://cloud-relay.example/v1"
@@ -53,11 +72,18 @@ def main():
     # 追加到本地月度文件
     month = datetime.now().strftime("%Y%m")
     path = os.path.join(LOCAL_DIR, "corpus_%s.jsonl" % month)
+    extra = _load_extra()
+    scrub_hits = 0
     with open(path, "a", encoding="utf-8") as f:
         for ln in lines:
-            f.write(ln + "\n")
+            clean, _h = _redact.redact_jsonl_line(ln, extra)
+            scrub_hits += _h
+            f.write(clean + "\n")
         f.flush()
         os.fsync(f.fileno())
+    if scrub_hits:
+        log("local scrub: %d secret hits redacted before write"
+            % scrub_hits)
     got_max = 0
     for ln in lines:
         try:
