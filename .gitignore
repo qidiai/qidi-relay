@@ -33,3 +33,8 @@ __pycache__/
 
 # Large binaries
 hunyuanocr/models/
+
+# Publish hardening (2026-10-09, pre-push audit)
+wb/accounts/
+conversations.json
+.pytest_cache/
