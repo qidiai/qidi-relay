@@ -31,6 +31,14 @@ CORPUS_DIR = BASE_DIR / "corpus_local"
 LITELLM_API_BASE = "https://codely-litellm.tuanjie.cn"
 CLI_API_KEY_FETCH_URL = "https://codely.tuanjie.cn/api/api-token/cli-api-key"
 
+# OpenCode serve 桥默认地址（T12，opencode-serve 通道）。
+# 新模块一律走 settings.py 路径常量模式（§7.7 纪律）：缺省
+# http://127.0.0.1:4096（`opencode serve --port 4096` 常驻桥），
+# config.json 的 providers.<name>.base_url 可显式覆盖；测试可
+# 直接重定向本常量（monkeypatch proxy_core.opencode.DEFAULT_
+# SERVE_BASE 或 settings.OPENCODE_SERVE_BASE）。
+OPENCODE_SERVE_BASE = "http://127.0.0.1:4096"
+
 DEFAULT_PORT = 8765
 VERSION = "5.0.0-dev"
 

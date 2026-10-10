@@ -23,6 +23,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from proxy_core import providers
 from proxy_core import cline
 from proxy_core import minicode
+from proxy_core import opencode
 from proxy_core import anthropic
 from proxy_core import affinity
 from proxy_core import budget
@@ -2462,6 +2463,162 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                              "upstream_exception", 502)
 
 
+# ─── OpenCode serve 桥通道转发（2026-10-10 新增，T12） ─────────────────────
+
+# 桥的 provider id 固定为 "opencode"（OpenCode 客户端内的 provider 名）。
+OPENCODE_PROVIDER_ID = "opencode"
+
+
+def _parse_opencode_model_id(model: str) -> str:
+    """`opencode/<model_id>` → `<model_id>`（裸名回落：无斜杠原样返回）。
+
+    模型呈现为带前缀的 `opencode/ling-3.1-flash-free`——与 openrouter
+    （`deepseek/deepseek-chat`）、cline（`cline-free/...`）同款带前缀惯例：
+    守卫白名单 / providers.match 均按整串处理，前缀不触发任何斜杠特判。
+    转发前剥掉 `opencode/` 前缀，只把裸 modelID 交给桥（桥 /message body
+    的 model.modelID 只要裸名）。
+    """
+    m = (model or "").strip()
+    if "/" in m:
+        prefix, rest = m.split("/", 1)
+        if prefix == OPENCODE_PROVIDER_ID and rest.strip():
+            return rest.strip()
+    return m
+
+
+def _opencode_sse_lines(resp_obj: dict) -> list:
+    """完整 OpenAI 形响应 → OpenAI SSE 行列表（伪流式）。
+
+    伪流式：桥为阻塞协议（POST /session/{id}/message 阻塞返回全文，无增量
+    流），流式请求也只能拿到全文后一次性吐——这里按 chat.completion.chunk
+    形状逐行拆 content，末尾补 finish 帧 + usage 帧 + [DONE]，令只认 SSE 的
+    客户端（代理链常嗅探 Content-Type）也能正常收。
+
+    学 cline 通道伪流式手法（_forward_cline 在 force_stream 时同样把非流式
+    全文呈现为 SSE 给客户端）。
+    """
+    cid = resp_obj.get("id") or ("chatcmpl-opencode-%d" % int(time.time() * 1000))
+    model = resp_obj.get("model", "")
+    created = resp_obj.get("created") or int(time.time())
+    base = {"id": cid, "object": "chat.completion.chunk",
+            "created": created, "model": model}
+    choice0 = (resp_obj.get("choices") or [{}])[0]
+    msg = choice0.get("message") or {}
+    finish = choice0.get("finish_reason") or "stop"
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    usage = resp_obj.get("usage") or {}
+
+    def _frame(delta: dict, finish_reason=None) -> str:
+        payload = dict(base)
+        payload["choices"] = [{"index": 0, "delta": delta,
+                               "finish_reason": finish_reason}]
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+    lines = [_frame({"role": "assistant", "content": ""})]
+    if reasoning:
+        lines.append(_frame({"reasoning_content": reasoning}))
+    if content:
+        # 逐行拆（保留行尾换行）——"逐行吐"对齐伪流式约定
+        segs = content.split("\n")
+        for i, seg in enumerate(segs):
+            piece = seg + ("\n" if i < len(segs) - 1 else "")
+            lines.append(_frame({"content": piece}))
+    lines.append(_frame({}, finish))
+    # usage 帧（OpenAI include_usage 形状：choices 空、顶层带 usage）
+    uframe = dict(base)
+    uframe["choices"] = []
+    uframe["usage"] = usage
+    lines.append("data: " + json.dumps(uframe, ensure_ascii=False) + "\n\n")
+    lines.append("data: [DONE]\n\n")
+    return lines
+
+
+def _forward_opencode(data: dict, model: str, prov: dict):
+    """转发到 OpenCode serve 桥（本机 127.0.0.1:4096，OpenCode Go 订阅 free 模型）。
+
+    桥协议阻塞式（见 proxy_core.opencode）：非流式 = 直接转 OpenAI 形响应；
+    流式请求 = 伪流式（全文拿到后按 OpenAI SSE 逐行吐 + [DONE]，桥无增量流）。
+
+    桥不可达（ConnectionRefused/超时/上游 info.error）→ proxy_core.opencode
+    抛 OpenCodeBridgeError → 这里记 503 判负：只耗 attempt 换号，**不写任何
+    冷却表**（桥是本机常驻服务，掉线是"稍后重试/修桥"而非"该账号冷却"）。
+    pricing：这些 free 模型 0/0，costing 自然算 0（无需定价表）。
+    """
+    started = time.perf_counter()
+    _sanitize_for_external(data)
+    pname = prov["name"]
+    model_id = _parse_opencode_model_id(model)
+    messages = data.get("messages") or []
+    is_stream = bool(data.get("stream"))
+    try:
+        result = opencode.send_chat(messages, model_id, provider_name=pname)
+    except opencode.OpenCodeBridgeError as e:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        log.warning("[opencode] 桥不可达（%s）：%s", model, e)
+        activity.add("error", f"{model} · {pname} 桥不可达",
+                     model=model, user_id=pname, latency_ms=latency_ms,
+                     tokens=0, status=503)
+        kdb.record_error(pname, model, 503, "opencode_bridge_unreachable",
+                         str(e)[:200])
+        return _openai_error(
+            f"opencode serve bridge unreachable for model '{model}': {e}",
+            "proxy_upstream_error", "opencode_bridge_unreachable", 503)
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        log.error("[opencode] %s 异常: %s", pname, e)
+        activity.add("error", f"{model} · {pname} 异常: {e}",
+                     model=model, user_id=pname, latency_ms=latency_ms,
+                     tokens=0, status="异常")
+        kdb.record_error(pname, model, 502, "opencode_exception", str(e)[:200])
+        return _openai_error(f"opencode provider error: {e}",
+                             "proxy_upstream_error", "upstream_exception", 502)
+
+    usage_src = result.get("usage") or {}
+    usage = {
+        "prompt_tokens": int(usage_src.get("input") or 0),
+        "completion_tokens": int(usage_src.get("output") or 0),
+        "total_tokens": int(usage_src.get("total") or 0),
+    }
+    content = result.get("content") or ""
+    reasoning = result.get("reasoning") or ""
+    model_served = result.get("model_served") or model_id
+    msg = {"role": "assistant", "content": content}
+    if reasoning:
+        msg["reasoning"] = reasoning
+        msg["reasoning_content"] = reasoning
+    resp_obj = {
+        "id": "chatcmpl-opencode-%d" % int(time.time() * 1000),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,                      # 记账/呈现用客户端请求名（带前缀）
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": result.get("finish") or "stop",
+                     "logprobs": None}],
+        "usage": usage,
+    }
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    token_stats.record(pname, model, usage)
+    _record_key_usage(model, usage)
+    # 注水检测：桥回 modelID，核对是否与请求模型一致
+    water.observe(pname, model, model_served, usage,
+                  ttft_ms=latency_ms, total_ms=latency_ms)
+    activity.add("ok", f"{model} · {pname}", model=model, user_id=pname,
+                 latency_ms=latency_ms, tokens=usage["total_tokens"], status=200)
+    kdb.record_request(
+        user_id=pname, model_requested=model, model_served=model_served,
+        status_code=200, prompt_tokens=usage["prompt_tokens"],
+        completion_tokens=usage["completion_tokens"],
+        total_tokens=usage["total_tokens"], duration_ms=latency_ms,
+        is_stream=is_stream,
+    )
+    if is_stream:
+        sse = "".join(_opencode_sse_lines(resp_obj))
+        return Response(sse, content_type="text/event-stream")
+    return jsonify(resp_obj)
+
+
 def _forward_external(data: dict, model: str, prov: dict):
     """转发到外部 OpenAI 兼容 Provider（静态 API Key，不占主账号池）。
 
@@ -2476,6 +2633,8 @@ def _forward_external(data: dict, model: str, prov: dict):
         return _forward_cline(data, model, prov)
     if providers.is_minicode(prov):
         return _forward_minicode(data, model, prov)
+    if providers.is_opencode(prov):
+        return _forward_opencode(data, model, prov)
     started = time.perf_counter()
     _sanitize_for_external(data)
     # 0928: model_aliases 别名命中时把请求体重写为上游真实模型 ID；

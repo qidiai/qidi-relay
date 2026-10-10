@@ -41,6 +41,7 @@ import threading
 from . import atomcode
 from . import cline
 from . import minicode
+from . import opencode
 from .router import registry
 from .settings import CONFIG_FILE, load_config
 
@@ -139,6 +140,7 @@ def _load_providers() -> dict:
         atomcode.reload_channels_from_config(cfg)
         cline.reload_channels_from_config(cfg)
         minicode.reload_channels_from_config(cfg)
+        opencode.reload_from_config(cfg)
         provs = {}
         for name, p in (cfg.get("providers") or {}).items():
             if not isinstance(p, dict):
@@ -195,6 +197,24 @@ def _load_providers() -> dict:
                     }
                 else:
                     log.warning("provider %s (minicode) 未配置 models，已忽略", name)
+            elif p.get("type") == "opencode-serve":
+                # OpenCode serve 桥通道（T12）：无静态 key，OpenCode Go 订阅的
+                # free 模型只能经 `opencode serve` 桥（本机 127.0.0.1:4096）
+                # 调用——key 直连官方 zen 网关 403/402。base_url 缺省取桥默认
+                # 地址（settings.OPENCODE_SERVE_BASE，可注入），config 可显式覆盖。
+                # 桥掉线是"可判负"的外部通道：判负只耗 attempt 换号，不触发冷却。
+                if models:
+                    provs[name] = {
+                        "name": name,
+                        "enabled": enabled,
+                        "type": "opencode-serve",
+                        "base_url": base_url or opencode.DEFAULT_SERVE_BASE,
+                        "api_key": None,
+                        "keys": [],
+                        "models": models,
+                    }
+                else:
+                    log.warning("provider %s (opencode-serve) 未配置 models，已忽略", name)
             else:
                 keys = _parse_keys(name, p)
                 if base_url and keys and models:
@@ -295,3 +315,8 @@ def is_cline(prov: dict) -> bool:
 def is_minicode(prov: dict) -> bool:
     """该 provider 是否为 MiniCode（mcode）官方通道（凭证/协议转换由 proxy_core.minicode 负责）。"""
     return bool(prov) and prov.get("type") == "minicode"
+
+
+def is_opencode(prov: dict) -> bool:
+    """该 provider 是否为 OpenCode serve 桥通道（协议转换/会话压缩由 proxy_core.opencode 负责）。"""
+    return bool(prov) and prov.get("type") == "opencode-serve"
