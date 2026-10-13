@@ -34,8 +34,21 @@ def _load_extra():
 
 STATE = os.path.join(BASE_DIR, "corpus_state.json")
 LOG = os.path.join(BASE_DIR, "corpus_pull.log")
-URL = "https://cloud-relay.example/v1"
-KEY = "REDACTED-PULL-KEY"
+# 公开仓库去硬编码（2026-10-13）：拉取端点与 key 改从
+# config.json corpus.pull_url / corpus.pull_key 读取，
+# 缺失时友好退出——仓库里不再含任何可用的云端凭证。
+_cfg_pull = {}
+try:
+    _cfg_pull = json.load(open(os.path.join(BASE_DIR, "config.json"),
+                               encoding="utf-8")).get("corpus") or {}
+except Exception:
+    _cfg_pull = {}
+URL = str(_cfg_pull.get("pull_url") or "").rstrip("/")
+KEY = str(_cfg_pull.get("pull_key") or "")
+if not URL or not KEY:
+    print("corpus_pull: config.json 缺 corpus.pull_url / corpus.pull_key，"
+          "未配置拉取端点，退出。", file=sys.stderr)
+    sys.exit(2)
 
 
 def log(msg):
