@@ -296,6 +296,8 @@ def checkin_channel(ch, timeout, dry_run, uid_seen=None):
 
 def main():
     ap = argparse.ArgumentParser(description="MiniCode（mcode）账号每日福利签到")
+    ap.add_argument("--accounts", default=str(ACCOUNTS_FILE),
+                    help="多账号名册路径（缺省 minicode/accounts.json）")
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--delay", type=float, default=2.0, help="多账号间隔秒数")
     ap.add_argument("--dry-run", action="store_true", help="只查面板不领取")
@@ -319,7 +321,7 @@ def main():
     base_p = next((p for p in (cfg.get("providers") or {}).values()
                    if isinstance(p, dict) and p.get("type") == "minicode"), {})
     region = str(base_p.get("region") or "cn")
-    for acc in load_accounts():
+    for acc in load_accounts(args.accounts):
         ap = os.path.normcase(os.path.abspath(acc["auth_path"]))
         if ap in seen_paths:
             log(f"[{acc['label']}] 与主号同一 auth 文件，去重跳过")

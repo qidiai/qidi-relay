@@ -79,3 +79,21 @@ schtasks /delete /f /tn "minicode-checkin"
 - `enabled: false` 跳过；auth 文件缺失跳过并记日志，不影响其他账号；
 - 逐账号签到（间隔 `--delay` 秒），汇总逐账号状态；
 - 退出码 0 = 全部真实账号完成；accounts.json 缺失时仅主号签到（行为同旧版）。
+
+## 多账号存活纪律（重要，2026-10-13）
+
+与 codely_points 的**静态长效 token** 不同，mcode 的 OAuth token 是
+**小时级短时效 + refresh_token 轮换 + 切换登录可吊销**——快照账号能否
+长期存活取决于使用纪律：
+
+1. **登录后立即快照**：mcode 登录该账号后马上 `python _qidi_tmp_save_account.py`
+   （或让我跑），把当时的 refresh_token 落进快照文件；
+2. **快照后不再动它**：不要再在该账号下使用 mcode 客户端/登录登出——
+   客户端轮换或登出会吊销 refresh_token，快照立刻失效（`invalid_grant`）；
+3. **快照自持**：签到时 token 过期会自动用快照里的 refresh_token 续期并
+   **写回快照文件**（等效 codely 的长效 token，只要没人吊销它）；
+4. **失效自愈**：日志出现 `AUTH_ERROR`（invalid_grant）即快照已死，
+   只能重新登录该账号 → 重新快照（同名覆盖）。
+
+结构对齐 codely_points：accounts.json 条目 `{label, auth_path, enabled}`、
+`--accounts` 参数、状态分类 CLAIMED/ALREADY/AUTH_ERROR/SKIPPED。
