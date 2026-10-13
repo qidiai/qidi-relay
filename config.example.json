@@ -1,0 +1,47 @@
+{
+  "_comment": "复制本文件为 config.json 后修改。所有字段都可省略，程序有安全默认值。改 config.json 免重启即生效（数据热加载）。",
+
+  "admin_password": null,
+  "_admin_password_说明": "管理界面密码的 SHA256（网页端设置后自动写入）；null=不设密码。局域网自用可不设，公网部署务必设置。设置方法：启动后打开管理界面右上角直接设置即可。",
+
+  "allowed_ips": ["*"],
+  "_allowed_ips_说明": "允许访问管理接口的 IP 白名单，[\"*\"] = 不限制；公网部署建议填自己的 IP 段。",
+
+  "port": 8765,
+  "_port_说明": "服务监听端口，默认 8765。",
+
+  "api_keys": [],
+  "_api_keys_说明": "调用 /v1/* 接口需要的 API Key 列表（客户端 Authorization: Bearer <key>）。空列表 = 不鉴权，局域网自用可留空；公网部署强烈建议设置。每个 key 还可以带日预算（见 providers 示例里的 budget 用法，详见 proxy_core/budget.py）。",
+
+  "vision_model": "codely-vl",
+  "vision_capable_models": ["codely-vl"],
+  "_vision_说明": "收到图片/音频等媒体内容时，若目标模型不在 vision_capable_models 里，自动改路由到 vision_model，避免纯文本模型 400 报错。",
+
+  "providers": {
+    "示例-静态key直转-可删": {
+      "base_url": "https://api.任意OpenAI兼容服务.com/v1",
+      "api_key": "sk-你的Key",
+      "models": ["模型名1", "模型名2"]
+    },
+    "示例-多key轮换与每key停用-可删": {
+      "base_url": "https://api.另一个服务.com/v1",
+      "api_keys": [
+        "sk-简单字符串Key也可以",
+        {"key": "sk-带标签的Key", "label": "渠道商A"},
+        {"key": "sk-额度耗尽的Key", "label": "渠道商B", "disabled": true}
+      ],
+      "models": ["模型名3"],
+      "_api_keys_说明": "字符串与对象元素可混用（自动去重合并）。disabled=true 的 key 保留在池中但不参与选号，面板显示'已停用'，额度重置后面板一键启用（F14）。"
+    },
+    "示例-Go网关直连-可删": {
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_keys": ["你的Go订阅APIKey"],
+      "models": ["glm-5.3-flash"],
+      "enabled": true,
+      "headers": {"User-Agent": "my-coding-agent/1.0"},
+      "session_header": "x-opencode-session",
+      "_说明": "T13：Go 网关要求客户端自带 User-Agent（拒 python-httpx 默认 UA）与稳定 x-opencode-session 会话头（路由/提示缓存优化+滥用识别）。headers 为每请求原样附加的静态头（Authorization 不可覆盖）；session_header 指定会话头名，每请求自动生成 sess_<hex> 会话 ID。enabled=false 可整渠道停用（T10），面板可切。"
+    }
+  },
+  "_providers_说明": "外部 OpenAI 兼容模型源。model 命中 models 列表时直接转发到该源。不需要就删掉整个 providers 或留空 {}。渠道的增/删/启停/探针/Key管理均可网页面板自助完成。"
+}

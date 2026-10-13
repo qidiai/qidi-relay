@@ -1,0 +1,20 @@
+{
+  "base_url": "https://vibex.runninghub.cn/vc",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8787,
+  "api_key": "",
+  "token": "",
+  "tenant_id": "",
+  "app_name": "vibex2api",
+  "app_type": "web",
+  "model": "",
+  "fresh_session": true,
+  "turn_timeout": 900,
+  "ready_timeout": 90,
+  "queue_limit": 4,
+  "heartbeat_s": 15,
+  "include_thinking": false,
+  "expose_tools": false,
+  "chat_instruction": "",
+  "connect_mode": "auto"
+}

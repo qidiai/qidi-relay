@@ -1,0 +1,12 @@
+{
+  "_comment": "复制本文件为 accounts.json 后填入你自己的 Codely 账号；也可以启动后在管理界面网页里添加（推荐）。字段：user_id=JWT 里的 sub，org_id=JWT 里的 unity_id，access_token=登录 codely.tuanjie.cn 后浏览器 F12 网络请求里的 Authorization Bearer 值。",
+  "accounts": [
+    {
+      "user_id": "你的用户ID",
+      "username": "备注名(可空)",
+      "org_id": "组织ID(可空)",
+      "access_token": "eyJhbGciOi....你的JWT",
+      "enabled": true
+    }
+  ]
+}
