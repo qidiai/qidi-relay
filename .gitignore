@@ -45,3 +45,4 @@ _tmp_*.txt
 
 # minicode 多账号登记（本机路径，不入库；模板见 accounts.example.json）
 minicode/accounts.json
+minicode/accounts/
