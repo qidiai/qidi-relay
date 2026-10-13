@@ -1,0 +1,13 @@
+{
+  "accounts": [
+    {
+      "label": "小号1",
+      "auth_path": "G:/程序开发/本地局域网中转-v3/minicode/accounts/小号1.json"
+    },
+    {
+      "label": "小号2",
+      "auth_path": "C:/Users/你/.minimax/auth/prod/cn/mcode-public/auth.json",
+      "enabled": false
+    }
+  ]
+}

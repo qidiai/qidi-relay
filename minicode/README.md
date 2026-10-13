@@ -53,3 +53,29 @@ schtasks /delete /f /tn "minicode-checkin"
   开源仓库 `tui/src/checkin/http-gateway.ts` + `tui/src/runtime/public-gateway.ts`，
   对照最新源码即可修正。
 - 中转程序本身不依赖本脚本：即使签到失败，反代通道照常工作。
+
+## 多账号（accounts.json，2026-10-13）
+
+除 config.json 里 `type: minicode` 的主号通道外，可追加任意数量小号：
+每个账号一份 mcode auth.json（该账号在 mcode CLI 登录后生成），凭证
+刷新/写回按文件隔离互不影响。
+
+1. **账号登录**：mcode CLI 切换账号登录，得到该账号的
+   `~/.minimax/auth/prod/cn/mcode-public/auth.json`；
+2. **拷贝留档**：复制到 `minicode/accounts/<label>.json`（任意路径均可）；
+3. **登记账号**：把 `accounts.example.json` 复制为 `accounts.json` 并填入：
+
+```json
+{
+  "accounts": [
+    {"label": "小号1", "auth_path": "G:/程序开发/本地局域网中转-v3/minicode/accounts/小号1.json"},
+    {"label": "小号2", "auth_path": "C:/Users/你/.minimax/auth/prod/cn/mcode-public/auth.json", "enabled": false}
+  ]
+}
+```
+
+规则：
+- 同一 auth 文件重复登记（主号/小号撞车）只签一次（路径去重）；
+- `enabled: false` 跳过；auth 文件缺失跳过并记日志，不影响其他账号；
+- 逐账号签到（间隔 `--delay` 秒），汇总逐账号状态；
+- 退出码 0 = 全部真实账号完成；accounts.json 缺失时仅主号签到（行为同旧版）。

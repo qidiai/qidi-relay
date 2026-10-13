@@ -28,6 +28,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -49,6 +50,7 @@ from proxy_core import minicode  # noqa: E402
 from proxy_core.settings import load_config  # noqa: E402
 
 LOG = Path(__file__).resolve().parent / "checkin.log"
+ACCOUNTS_FILE = Path(__file__).resolve().parent / "accounts.json"
 
 APP_VERSION = "0.5.10"                    # tui/package.json 版本（desktop_version 查询参数）
 GATEWAY_ORIGIN = "https://agent.minimaxi.com"      # 签到公共网关（cn prod）
@@ -67,6 +69,41 @@ def log(msg):
     with LOG.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     print(line)
+
+
+def load_accounts(accounts_file=None):
+    """minicode/accounts.json -> [{"label","auth_path"}...]（多账号追加）。
+
+    - dict {"accounts": [...]} 或裸 list 均可；
+    - enabled=false 跳过（记一行日志）；缺 auth_path 跳过；
+    - label 缺省取 auth 文件名 stem。
+    容错：文件缺失/损坏 -> []（仅主号签到，行为同旧版）。"""
+    path = Path(accounts_file) if accounts_file else ACCOUNTS_FILE
+    try:
+        doc = json.load(path.open(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log(f"accounts.json 解析失败: {SECRET.sub('<redacted>', str(e))[:120]}")
+        return []
+    items = doc.get("accounts") if isinstance(doc, dict) else doc
+    if not isinstance(items, list):
+        log("accounts.json 结构应为 list 或 {accounts: list}，忽略")
+        return []
+    out = []
+    for i, it in enumerate(items, 1):
+        if not isinstance(it, dict):
+            continue
+        ap = str(it.get("auth_path") or "").strip()
+        if not ap:
+            log(f"accounts[{i}] 缺 auth_path，跳过")
+            continue
+        if it.get("enabled", True) is False:
+            log(f"accounts[{i}] enabled=false，跳过")
+            continue
+        label = str(it.get("label") or Path(ap).stem or f"account-{i}")
+        out.append({"label": label, "auth_path": ap})
+    return out
 
 
 def _md5(text):
@@ -261,6 +298,30 @@ def main():
     for name, p in (cfg.get("providers") or {}).items():
         if isinstance(p, dict) and p.get("type") == "minicode":
             targets.extend(minicode.channels_for(name))
+
+    # ── 多账号（2026-10-13）：minicode/accounts.json 追加账号 ──
+    # 主号 = config providers 的 minicode 通道；小号 = accounts.json
+    # 逐条 auth_path（各自 mcode 登录后拷贝的 auth.json，凭证
+    # 刷新/写回按文件隔离互不影响）。同一凭证文件只签一次。
+    seen_paths = set()
+    for ch in targets:
+        if ch.auth_path:
+            seen_paths.add(os.path.normcase(os.path.abspath(ch.auth_path)))
+    base_p = next((p for p in (cfg.get("providers") or {}).values()
+                   if isinstance(p, dict) and p.get("type") == "minicode"), {})
+    region = str(base_p.get("region") or "cn")
+    for acc in load_accounts():
+        ap = os.path.normcase(os.path.abspath(acc["auth_path"]))
+        if ap in seen_paths:
+            log(f"[{acc['label']}] 与主号同一 auth 文件，去重跳过")
+            continue
+        seen_paths.add(ap)
+        if not Path(acc["auth_path"]).exists():
+            log(f"[{acc['label']}] auth 文件不存在，跳过: {acc['auth_path']}")
+            continue
+        targets.append(minicode.MiniCodeChannel(
+            "minicode", {"auth_path": acc["auth_path"], "region": region},
+            label=acc["label"]))
     if not targets:
         log("config.json 无 type=minicode provider，退出")
         sys.exit(1)
