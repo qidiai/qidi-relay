@@ -220,7 +220,7 @@ def _panel_line(panel):
     return "面板无今日条目"
 
 
-def checkin_channel(ch, timeout, dry_run):
+def checkin_channel(ch, timeout, dry_run, uid_seen=None):
     """单账号签到：token（自动刷新）→ realUserID → status →（可领则）claim。
 
     返回分类：CLAIMED / ALREADY / UNAVAILABLE / AUTH_ERROR / FAILED。
@@ -236,6 +236,15 @@ def checkin_channel(ch, timeout, dry_run):
     except Exception as e:
         log(f"[{label}] {SECRET.sub('<redacted>', str(e))[:160]}")
         return "FAILED"
+
+    # ── uid 身份去重（2026-10-13）：主号通道跟随当前登录态，
+    # 可能与 accounts.json 快照是同一账号——同 uid 只签一次，
+    # 后到者直接跳过（省一次 claim 请求与日志噪音）。
+    if uid_seen is not None:
+        if uid in uid_seen:
+            log(f"[{label}] 与已签到账号同身份（uid 相同），跳过")
+            return "ALREADY"
+        uid_seen.add(uid)
 
     status, text = _request("GET", GATEWAY_ORIGIN, STATUS_PATH, token, uid,
                             "gateway", None, timeout)
@@ -329,10 +338,12 @@ def main():
     log(f"==== MiniCode 签到开始（{len(targets)} 账号，dry-run={args.dry_run}）====")
     ok, bad = {"CLAIMED", "ALREADY", "UNAVAILABLE", "CLAIMABLE_DRY"}, 0
     summary = {}
+    uid_seen = set()
     for i, ch in enumerate(targets):
         if i:
             time.sleep(args.delay)
-        summary[ch.label] = checkin_channel(ch, args.timeout, args.dry_run)
+        summary[ch.label] = checkin_channel(ch, args.timeout, args.dry_run,
+                                            uid_seen)
     good = sum(1 for v in summary.values() if v in ok)
     log("==== 签到结束：" + "、".join(f"{k}={v}" for k, v in summary.items()) + " ====")
     sys.exit(0 if good == len(targets) else 1)

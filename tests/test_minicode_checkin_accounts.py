@@ -77,3 +77,32 @@ def test_load_accounts_corrupt_returns_empty(tmp_path):
     f = tmp_path / "accounts.json"
     f.write_text("{not json", encoding="utf-8")
     assert MC.load_accounts(f) == []
+
+
+def test_checkin_channel_uid_dedup(tmp_path, monkeypatch):
+    """同 uid 二次进入 -> ALREADY，且不再发任何 claim/status 请求（零网络）"""
+    MC.LOG = tmp_path / "t-dedup.log"
+    ap = tmp_path / "y.json"
+    ap.write_text(json.dumps(_auth_doc(access="mmoat_yyy")),
+                  encoding="utf-8")
+    ch = minicode.MiniCodeChannel(
+        "minicode", {"auth_path": str(ap), "region": "cn"}, label="小号Y")
+    monkeypatch.setattr(MC, "_fetch_real_user_id",
+                        lambda token, timeout: "UID-DUP")
+
+    def _boom(*a, **k):
+        raise AssertionError("uid 去重命中后不应再发请求")
+    monkeypatch.setattr(MC, "_request", _boom)
+
+    seen = {"UID-DUP"}
+    r = MC.checkin_channel(ch, 5, True, seen)
+    assert r == "ALREADY"
+
+    # 首次进入（seen 不含 uid）-> 正常放行去 fetch 身份后加入集合
+    seen2 = set()
+    monkeypatch.setattr(MC, "_request",
+                        lambda *a, **k: (200, '{"base_resp":{"status_code":0},'
+                                          '"data":{"days":[]}}'))
+    r2 = MC.checkin_channel(ch, 5, True, seen2)
+    assert "UID-DUP" in seen2
+    assert r2 == "UNAVAILABLE"   # days 空 -> 无可签日
