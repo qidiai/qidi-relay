@@ -47,6 +47,7 @@ web/
 | Cline 官方通道 | provider `"type": "cline"`：凭证跟随 Cline 客户端登录态（providers.json mtime 感知）、token 过期自动刷新并原子回写、客户端指纹头、免费模型串行门 + 429 冷却解析 |
 | MiniCode 官方通道 | provider `"type": "minicode"`（2026-10-01）：MiniMax mcode 登录态反代（`~/.minimax/auth/prod/cn/mcode-public/auth.json`，mtime 感知），上游 Anthropic Messages 协议自动转 OpenAI；token 短时效自动 OAuth 刷新（refresh_token 轮换立即落盘，generation 不动与官方客户端共存）；模型 `mcode-m3`（512K/图像输入/thinking 可关）/ `mcode-m3.1-flash`（effort 档位）/ `mcode-m2.7-highspeed` / `mcode-m2.7`；429 冷却解析、瞬时 400 限次重试、管理面板通道状态 |
 | Anthropic 型号别名 | config.json 的 `anthropic_model_aliases` 把客户端内置型号名（`claude-*`）收编到中转真实模型，仅 `/v1/messages` 生效 |
+| 渠道接入示例 | apigoto 聚合网关完整接入步骤（面板添加 / config 手写 / 多 Key 轮换 / 停用启用）见 [docs/apigoto.md](docs/apigoto.md) |
 
 ## 启动
 
