@@ -2684,6 +2684,21 @@ def _forward_external(data: dict, model: str, prov: dict):
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if is_stream else "application/json",
         }
+        # T13：provider 级静态附加头（config providers.<name>.headers）——
+        # Go 网关（opencode.ai/zen/go）拒绝 python-httpx 默认 UA，要求客户端
+        # 自带标识 UA；静态头每次原样合并，后写同名校验 Authorization 之类
+        # 基础头（配置写错时以上游认证为准，不静默放行匿名请求）。
+        for hk, hv in (prov.get("headers") or {}).items():
+            if hk.lower() in ("authorization",):
+                continue
+            h[hk] = hv
+        # T13：会话头（config providers.<name>.session_header）——每请求生成
+        # 一个新会话 ID（sess_<hex>）。Go 网关按 x-opencode-session 做路由/
+        # 提示缓存优化并识别滥用流量；v1 按请求粒度生成（客户端 conversation
+        # 维度稳定 ID 留待 v2，见 providers.py 模块文档）。
+        sh = prov.get("session_header")
+        if sh:
+            h[sh] = "sess_" + uuid.uuid4().hex[:16]
         return h
 
     try:

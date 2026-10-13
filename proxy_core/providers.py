@@ -25,14 +25,25 @@ config.json 示例：
 配置带 mtime 缓存，改 config.json 免重启即生效。
 
 **多 key 池**：api_key（单 key，向后兼容）与 api_keys（数组）可任用其一或
-混用（自动去重合并）。数组元素是字符串或 {"key": ..., "label": ...}；
+混用（自动去重合并）。数组元素是字符串或
+{"key": ..., "label": ..., "disabled": true}；
 label 缺省为 "<provider>·<序号>"。选号策略与主账号池同款：
 最少进行中请求优先，同负载轮转。同一 key 重复出现 = 更高选中权重。
 非流式请求遇 401/402/403/429 自动换下一个 key 重试（详见 routes/proxy.py）。
+**F14 per-key 启停**：数组 dict 元素可带 "disabled": true——停用的 key
+保留在池内（不清除本体）但不参与选号（pick_key 跳过），且不计入面板
+key_count；用于额度耗尽的 key 先停用、额度重置后再启用。
 
 type 为 "atomcode" 的 provider 不需要 api_key：凭证从官方客户端的
 ~/.atomcode/auth.toml 自动加载（用户登录官方客户端后自动生效），
 请求头由 proxy_core.atomcode 的 sign_v1 动态签名。
+
+**附加请求头**（T13，OpenCode Go 网关直连）：静态 key 型 provider 可选配
+  - "headers": {"User-Agent": "my-agent/1.0"}     静态附加头（每请求原样带上）
+  - "session_header": "x-opencode-session"        会话头名——每请求自动生成
+    一个 sess_<hex> 会话 ID 填入该头（Go 网关的路由/提示缓存优化与滥用识别
+    要求；会话级稳定 ID 由客户端侧按 conversation 维度另议，v1 按请求粒度）
+典型用途：网关拒绝通用 SDK UA（python-httpx）或要求带会话头的场景。
 """
 
 import logging
@@ -53,34 +64,41 @@ _key_rr = {}   # provider name -> 轮转游标（同负载时轮转选 key）
 
 
 def _parse_keys(name: str, p: dict) -> list:
-    """把 api_key / api_keys 归一化为 [{"key": ..., "label": ...}] 列表。
+    """把 api_key / api_keys 归一化为 [{"key", "label"[, "disabled"]}] 列表。
 
     规则：
     - 数组元素可为字符串或 {"key": ..., "label": ...}；label 缺省 "<provider>·<序号>"
     - 带 label 的重复 key 保留（故意加权重）；无 label 的重复 key 去重
       （防 api_key 单值与 api_keys 数组意外重复）
+    - disabled（F14 per-key 启停）：dict 条目透传其 disabled 真值——仅当
+      停用时输出 "disabled": True（启用态省略该键，保持 config 干净）；
+      str 条目恒为启用态。停用的 key 保留在池内但不参与 pick_key 选号。
     """
-    raw_entries = []
+    raw_entries = []  # (key, label, disabled)
     arr = p.get("api_keys")
     if isinstance(arr, list):
         for k in arr:
             if isinstance(k, str) and k.strip():
-                raw_entries.append((k.strip(), ""))
+                raw_entries.append((k.strip(), "", False))
             elif isinstance(k, dict) and isinstance(k.get("key"), str) and k.get("key").strip():
-                raw_entries.append((k["key"].strip(), str(k.get("label") or "").strip()))
+                raw_entries.append((k["key"].strip(), str(k.get("label") or "").strip(),
+                                    bool(k.get("disabled"))))
     single = p.get("api_key")
     if isinstance(single, str) and single.strip():
-        raw_entries.append((single.strip(), ""))
+        raw_entries.append((single.strip(), "", False))
 
     # 保持输入顺序；无 label 的重复 key 去重，带 label 的重复保留
     out = []
     present = set()
-    for key, label in raw_entries:
+    for key, label, disabled in raw_entries:
+        entry = {"key": key, "label": label}
+        if disabled:
+            entry["disabled"] = True
         if label:
-            out.append({"key": key, "label": label})
+            out.append(entry)
             present.add(key)
         elif key not in present:
-            out.append({"key": key, "label": ""})  # 占位，稍后补默认 label
+            out.append(entry)  # 占位，稍后补默认 label
             present.add(key)
     # 补默认 label（防与显式 label 撞名——label 是负载跟踪的 key，必须唯一）
     used = {o["label"] for o in out if o["label"]}
@@ -95,6 +113,29 @@ def _parse_keys(name: str, p: dict) -> list:
             used.add(default)
             n += 1
     return out
+
+
+def _parse_headers(name: str, p: dict) -> dict:
+    """headers: {"静态附加头名": "值"}（T13）。
+
+    只收 str→str，其余（非字符串值/空名）忽略——坏条目绝不静默把一个
+    非字符串值塞进 httpx headers（那会在请求时炸 TypeError）。
+    """
+    raw = p.get("headers")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k).strip(): str(v)
+            for k, v in raw.items()
+            if isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()}
+
+
+def _parse_session_header(name: str, p: dict) -> str:
+    """session_header: 每请求自动生成会话 ID 填入的请求头名（T13）。
+
+    空串/非字符串 = 不启用（缺省行为逐字节不变）。
+    """
+    v = p.get("session_header")
+    return v.strip() if isinstance(v, str) and v.strip() else ""
 
 
 def _parse_aliases(name: str, p: dict) -> dict:
@@ -226,6 +267,10 @@ def _load_providers() -> dict:
                         "keys": keys,
                         "models": models,
                         "model_aliases": _parse_aliases(name, p),
+                        # T13：静态附加头 + 会话头（Go 网关直连准入要求）。
+                        # 缺省 {} 与 ""——行为与升级前逐字节一致。
+                        "headers": _parse_headers(name, p),
+                        "session_header": _parse_session_header(name, p),
                     }
                 else:
                     log.warning("provider %s 配置不完整（需 base_url/api_keys/models），已忽略", name)
@@ -240,6 +285,10 @@ def pick_key(prov: dict, exclude: set = None) -> dict | None:
     exclude：重试时排除已失败的 key（按 key 本体匹配）。
     """
     keys = prov.get("keys") or []
+    # F14: 停用（disabled）的 key 保留在池内但不参与选号——额度耗尽的 key
+    # 先停用，待额度重置再启用。与 exclude 叠加过滤后为空 → None
+    # （调用方 _forward_external 的 None 处理链已存在：无可用 key 直接判负）。
+    keys = [k for k in keys if not k.get("disabled")]
     if exclude:
         keys = [k for k in keys if k["key"] not in exclude]
     if not keys:

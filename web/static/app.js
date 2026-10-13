@@ -682,6 +682,9 @@ function renderProviderCard(p) {
     ? '<span class="badge off" title="已停用：模型从 /v1/models 消失，请求走模型守卫 404">已停用</span>'
     : '<span class="badge on" title="启用中">启用中</span>';
   const keyBadge = p.key_count > 1 ? `<span class="badge glm">${p.key_count} key 轮换</span>` : "";
+  // F14: 停用中的 key 数（额度耗尽先停用，保留在池中不参与路由轮换）
+  const disBadge = p.key_disabled_count > 0
+    ? `<span class="badge off" title="已停用的 key 保留在池中但不参与路由轮换，可随时启用">${p.key_disabled_count} 停用</span>` : "";
   const sub = p.subscription || null;
   const payBadge = sub && sub.has_payment_method ? '<span class="badge glm">已绑支付方式</span>' : "";
   const modelBadges = (p.models || []).map(m => `<span class="badge ext">${esc(m)}</span>`).join("");
@@ -721,9 +724,17 @@ function renderProviderCard(p) {
   // 静态 Provider 的 API Key 自助管理（卡片内增/删；AtomCode/Cline 通道不适用）
   let keySection = "";
   if (!p.atomcode && !p.cline) {
-    const krows = (p.key_entries || []).map(k =>
-      `<div class="ac-acct"><span title="脱敏预览 ${esc(k.preview)}">${esc(k.label)} · ${esc(k.preview)}</span>` +
-      `<button class="btn tiny danger" onclick="removeProviderKey('${esc(p.name)}','${esc(k.label)}')">移除</button></div>`).join("");
+    const krows = (p.key_entries || []).map(k => {
+      // F14: 停用的 key 保留在池中但不参与路由轮换（可再启用）
+      const off = !!k.disabled;
+      const badge = off ? '<span class="badge off">已停用</span>' : "";
+      const tbtn = off
+        ? `<button class="btn tiny primary" onclick="toggleProviderKey('${esc(p.name)}','${esc(k.label)}',false)">启用</button>`
+        : `<button class="btn tiny ghost" onclick="toggleProviderKey('${esc(p.name)}','${esc(k.label)}',true)">停用</button>`;
+      return `<div class="ac-acct${off ? " dim" : ""}"><span title="脱敏预览 ${esc(k.preview)}">${badge}${esc(k.label)} · ${esc(k.preview)}</span>` +
+        tbtn +
+        `<button class="btn tiny danger" onclick="removeProviderKey('${esc(p.name)}','${esc(k.label)}')">移除</button></div>`;
+    }).join("");
     keySection = `<div class="ac-accts">${krows || '<div class="ac-acct"><span class="dim">暂无 Key</span></div>'}</div>
       <div class="ac-upload">
         <input type="text" id="pk-label-${esc(p.name)}" placeholder="备注（可选，如：会员2）">
@@ -745,7 +756,7 @@ function renderProviderCard(p) {
       <span class="acc-name">${esc(p.name)}</span>
       <span class="acc-id">${esc(host)}</span>
     </div>
-    <div class="acc-badges">${stateBadge}${enBadge}${keyBadge}${payBadge}${modelBadges}</div>
+    <div class="acc-badges">${stateBadge}${enBadge}${keyBadge}${disBadge}${payBadge}${modelBadges}</div>
     ${(p.atomcode || p.cline) ? "" : `<div class="acc-meta"><span>累计用量 <b>${usageTxt}</b></span><span>${limitTxt}</span></div>`}
     ${acSection}
     ${clSection}
@@ -1049,6 +1060,24 @@ async function removeProviderKey(pname, label) {
       loadProvidersInfo();
     } else toast(d.error || "移除失败", true);
   } catch (e) { toast("移除失败: " + e.message, true); }
+}
+
+// F14: per-key 启用 / 停用（POST /api/provider/key/toggle）。
+// 低风险可逆操作（停用不清除 key），无 confirm；停用的 key 保留在池中
+// 但不参与路由轮换——额度耗尽的 key 先停用，待额度重置再启用。
+async function toggleProviderKey(pname, label, disabled) {
+  try {
+    const r = await api("/api/provider/key/toggle", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: pname, label, disabled }),
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      const tail = `${pname} 启用 ${d.key_count} / 停用 ${d.key_disabled_count}，热生效`;
+      toast(disabled ? `已停用「${d.label}」（${tail}）` : `已启用「${d.label}」（${tail}）`);
+      loadProvidersInfo();
+    } else toast(d.error || `操作失败（HTTP ${r.status}）`, true);
+  } catch (e) { toast("操作失败: " + e.message, true); }
 }
 
 async function loadProvidersInfo() {

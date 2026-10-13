@@ -890,6 +890,419 @@ def api_provider_remove(name):
     return jsonify({"provider": name, "key_count": key_count})
 
 
+# ─── F14 per-key 启用 / 停用（额度耗尽先停用，重置后再启用）──────────────
+# 文本级结构保留式改写（与 T10/F1/F6 同纪律：config.json pricing 节大小写
+# 折叠重复键不因回写丢失）——定位 provider 块 api_keys 数组中 label 对应
+# 条目，str 条目升级为 dict 文本、dict 条目插/删 "disabled" 成员。
+
+
+def _member_span(text: str, start: int, end: int, key: str):
+    """在 [start, end) 内找直辖成员 "key": 的 span（跳过嵌套对象/数组与
+    字符串字面量，只认本层直辖键）。返回 (key_start, key_end, value_start,
+    value_end)：key_start/key_end 为键字符串起/闭引号下标，value_end 为值
+    末字符后一位（不含尾随逗号）；未找到返回 None。"""
+    i = start
+    depth = 0
+    while i < end:
+        ch = text[i]
+        if ch == '"':
+            ks = i
+            j = i + 1
+            while j < end:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            ke = j
+            if depth == 0:
+                k = j + 1
+                while k < end and text[k] in " \t\r\n":
+                    k += 1
+                if k < end and text[k] == ":" and json.loads(text[ks:ke + 1]) == key:
+                    v = k + 1
+                    while v < end and text[v] in " \t\r\n":
+                        v += 1
+                    ve = v
+                    d2 = 0
+                    while ve < end:
+                        c2 = text[ve]
+                        if c2 == '"':
+                            ve += 1
+                            while ve < end:
+                                if text[ve] == "\\":
+                                    ve += 2
+                                    continue
+                                if text[ve] == '"':
+                                    break
+                                ve += 1
+                        elif c2 in "{[":
+                            d2 += 1
+                        elif c2 in "}]":
+                            if d2 == 0:
+                                break
+                            d2 -= 1
+                        elif c2 == "," and d2 == 0:
+                            break
+                        ve += 1
+                    return (ks, ke, v, ve)
+            i = j + 1
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        i += 1
+    return None
+
+
+def _array_end(text: str, open_idx: int) -> int:
+    """方括号配对（跳过字符串字面量），返回与 text[open_idx]=='['
+    匹配的闭括号下标；不配对抛 ValueError。"""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    break
+                i += 1
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError("方括号不配对")
+
+
+def _array_element_spans(text: str, arr_open: int, arr_close: int) -> list:
+    """顶层数组元素 [arr_open+1, arr_close) 的文本区间（已 trim 首尾空白）：
+    [(start, end), ...]。元素为字符串或对象，按顶层逗号切分。"""
+    out = []
+    i = arr_open + 1
+    d = 0
+    seg = None
+    while i <= arr_close:
+        ch = text[i] if i < arr_close else None
+        if ch == '"':
+            if seg is None:
+                seg = i
+            j = i + 1
+            while j < arr_close:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch is not None and ch in "{[":
+            if seg is None:
+                seg = i
+            d += 1
+        elif ch is not None and ch in "}]":
+            d -= 1
+        elif (ch == "," and d == 0) or ch is None:
+            if seg is not None:
+                e = i
+                while e > seg and text[e - 1] in " \t\r\n":
+                    e -= 1
+                out.append((seg, e))
+            seg = None
+        elif ch is not None and not ch.isspace():
+            if seg is None:
+                seg = i
+        i += 1
+    return out
+
+
+def _kept_key_indices(raw_arr: list) -> list:
+    """api_keys 数组中经 providers._parse_keys 去重后仍保留的原始下标（保持
+    顺序）。去重口径与 _parse_keys 第一段一致：带 label 的重复保留，无 label
+    的重复只留首个。"""
+    kept = []
+    present = set()
+    for i, k in enumerate(raw_arr):
+        if isinstance(k, str) and k.strip():
+            key, label = k.strip(), ""
+        elif isinstance(k, dict) and isinstance(k.get("key"), str) and k.get("key").strip():
+            key, label = k["key"].strip(), str(k.get("label") or "").strip()
+        else:
+            continue  # _parse_keys 同样跳过非法条目
+        if label or key not in present:
+            kept.append(i)
+            present.add(key)
+    return kept
+
+
+def _remove_member_in_text(text: str, obj_open: int, obj_close: int, span) -> str:
+    """删除对象块内某成员 span（ks,ke,vs,ve），按首/中/末/唯一成员
+    正确处理配套逗号。"""
+    ks, ke, vs, ve = span
+    # 尾逗号分支：成员后（跳空白）是逗号 → 删成员至逗号后空白
+    k = ve
+    while k < obj_close and text[k] in " \t\r\n":
+        k += 1
+    if k < obj_close and text[k] == ",":
+        e = k + 1
+        while e < obj_close and text[e] in " \t\r\n":
+            e += 1
+        return text[:ks] + text[e:]
+    # 前导逗号分支：成员前（跳空白回溯）是逗号 → 删逗号至成员尾
+    b = ks - 1
+    while b > obj_open and text[b] in " \t\r\n":
+        b -= 1
+    if b > obj_open and text[b] == ",":
+        return text[:b] + text[ve:]
+    # 唯一成员：删成员；块内仅剩空白 → 清空 {}
+    inner = text[obj_open + 1:ks] + text[ve:obj_close]
+    if not inner.strip():
+        return text[:obj_open + 1] + text[obj_close:]
+    return text[:ks] + text[ve:]
+
+
+def _set_dict_disabled(text: str, d_open: int, d_close: int, disabled: bool) -> str:
+    """在对象块 [d_open, d_close]（text[d_open]=='{'）内 置/清 "disabled"
+    成员：置时已有成员则改值为 true、无则块首插入 "disabled": true,（沿用
+    块内首成员缩进，与 T10 enabled 同纪律）；清时删除成员（禁用→启用，
+    保持 config 干净）。"""
+    span = _member_span(text, d_open + 1, d_close, "disabled")
+    if disabled:
+        if span is not None:
+            return text[:span[2]] + "true" + text[span[3]:]
+        after_open = d_open + 1
+        j = after_open
+        while j < d_close and text[j] in " \t\r\n":
+            j += 1
+        if j >= d_close:
+            ins = '"disabled": true'  # 空块 {}
+        else:
+            ws = text[after_open:j]
+            if "\n" in ws:
+                indent = ws[ws.rfind("\n") + 1:]
+                ins = "\n" + indent + '"disabled": true,'
+            else:
+                ins = '"disabled": true, '
+        return text[:after_open] + ins + text[after_open:]
+    if span is None:
+        return text  # 无 disabled 成员，本就启用态
+    return _remove_member_in_text(text, d_open, d_close, span)
+
+
+def _upgrade_legacy_api_key(text: str, block_open: int, block_close: int,
+                            label: str, disabled: bool) -> str:
+    """旧单 api_key 字段 → 折叠进 api_keys 数组（仅当无 api_keys 数组；
+    两者并存属病理配置，确定性拒绝）。"""
+    if _member_value_span(text, block_open + 1, block_close, "api_keys") is not None:
+        raise ValueError("provider 同时含 api_key 与 api_keys 字段，请先在面板清理")
+    ak = _member_span(text, block_open + 1, block_close, "api_key")
+    if ak is None:
+        raise ValueError("provider 无 api_key 字段")
+    ks, ke, vs, ve = ak
+    entry = {"key": json.loads(text[vs:ve]), "label": label}
+    if disabled:
+        entry["disabled"] = True
+    member = '"api_keys": ' + json.dumps([entry], ensure_ascii=False)
+    return text[:ks] + member + text[ve:]
+
+
+def _toggle_provider_key_in_text(text: str, name: str, label: str,
+                                 disabled: bool) -> str:
+    """文本级结构保留式改写 config.json 全文：把 providers 节内 name 块
+    api_keys 数组中 label 对应条目的 disabled 置 / 清。算法：
+
+    1. 写前全文件 json.loads 校验（坏 JSON 直接拒绝，不落盘）
+    2. N-1 前置校验：目标 provider 是对象（病理配置确定性拒绝）
+    3. 定位 "providers" 节（_brace_match）→ 目标 provider 块
+       （_member_value_span）→ 块内 api_keys 数组（_array_end）
+    4. 归一化 key 清单（providers._parse_keys）按 label 定目标条目，经
+       _kept_key_indices 映射回 api_keys 原始下标（旧单 api_key 为 -1）
+    5. 定位该元素文本（_array_element_spans）：str 条目 → 升级为 dict
+       文本（带 disabled）；dict 条目 → 插/删 "disabled" 成员
+    6. 写后复读校验：json.loads(new) 成功、该条目 disabled 确为目标值、
+       其余 provider 逐字段不变、顶层其他键不变、pricing 节逐字节保留
+       ——任一失败抛 ValueError，原文一字不动
+    """
+    import re
+    cfg = json.loads(text)  # 写前全文件校验
+    provs = cfg.get("providers") if isinstance(cfg, dict) else None
+    if not isinstance(provs, dict) or not isinstance(provs.get(name), dict):
+        raise ValueError(
+            'providers 节内无 provider「%s」（或条目非对象）' % name)
+    p = provs[name]
+    entries = providers._parse_keys(name, p)
+    if not any(e["label"] == label for e in entries):
+        raise ValueError('provider「%s」无 label「%s」的 key' % (name, label))
+    raw_arr = p.get("api_keys") if isinstance(p.get("api_keys"), list) else []
+    kept = _kept_key_indices(raw_arr)
+    ki = next(i for i, e in enumerate(entries) if e["label"] == label)
+    raw_index = kept[ki] if ki < len(kept) else -1
+    target_key = entries[ki]["key"]
+
+    m = re.search(r'"providers"\s*:\s*\{', text)
+    if not m:
+        raise ValueError('config.json 无 "providers" 节')
+    sec_open = m.end() - 1
+    sec_end = _brace_match(text, sec_open)
+    pblk = _member_value_span(text, sec_open + 1, sec_end, name)
+    if pblk is None:
+        raise ValueError('providers 节内无 provider「%s」' % name)
+    block_open = pblk[0]
+    if text[block_open] != "{":
+        raise ValueError('provider「%s」块非对象' % name)
+    block_close = _brace_match(text, block_open)
+
+    if raw_index == -1:
+        new_text = _upgrade_legacy_api_key(text, block_open, block_close,
+                                           label, disabled)
+    else:
+        ak = _member_value_span(text, block_open + 1, block_close, "api_keys")
+        if ak is None or text[ak[0]] != "[":
+            raise ValueError('provider「%s」无 api_keys 数组' % name)
+        arr_open = ak[0]
+        arr_close = _array_end(text, arr_open)
+        spans = _array_element_spans(text, arr_open, arr_close)
+        if raw_index >= len(spans):
+            raise ValueError('provider「%s」api_keys 下标越界' % name)
+        es, ee = spans[raw_index]
+        elem = json.loads(text[es:ee])
+        got_key = elem if isinstance(elem, str) else (
+            elem.get("key") if isinstance(elem, dict) else None)
+        if got_key != target_key:
+            raise ValueError('provider「%s」api_keys[%d] 与目标 key 不一致'
+                             % (name, raw_index))
+        if isinstance(elem, str):
+            # str 条目恒为启用态：停用 → 升级为 dict 文本；启用 → 空操作
+            if disabled:
+                new_elem = json.dumps(
+                    {"key": elem, "label": label, "disabled": True},
+                    ensure_ascii=False)
+                new_text = text[:es] + new_elem + text[ee:]
+            else:
+                new_text = text
+        elif isinstance(elem, dict):
+            d_close = _brace_match(text, es)
+            new_text = _set_dict_disabled(text, es, d_close, disabled)
+        else:
+            raise ValueError('api_keys[%d] 元素形态非法' % raw_index)
+
+    # 写后复读校验
+    check = json.loads(new_text)
+    np = (check.get("providers") or {}).get(name)
+    if not isinstance(np, dict):
+        raise ValueError("复读校验失败：provider 丢失")
+    got = next((e for e in providers._parse_keys(name, np)
+                if e["label"] == label), None)
+    if got is None:
+        raise ValueError("复读校验失败：key「%s」丢失" % label)
+    if bool(got.get("disabled")) != bool(disabled):
+        raise ValueError("复读校验失败：disabled=%r（期望 %r）"
+                         % (got.get("disabled"), disabled))
+    if '"pricing"' in text and '"providers"' in text:
+        sl = text[text.index('"pricing"'):text.index('"providers"')]
+        sn = new_text[new_text.index('"pricing"'):new_text.index('"providers"')]
+        if sl != sn:
+            raise ValueError("复读校验失败：pricing 节被改动")
+    for k2, v2 in (cfg.get("providers") or {}).items():
+        if k2 == name:
+            continue
+        if (check.get("providers") or {}).get(k2) != v2:
+            raise ValueError("复读校验失败：providers.%s 被改动" % k2)
+    for k2, v2 in cfg.items():
+        if k2 == "providers":
+            continue
+        if check.get(k2) != v2:
+            raise ValueError("复读校验失败：顶层键 %s 被改动" % k2)
+    return new_text
+
+
+def _set_provider_key_disabled(name: str, label: str, disabled: bool) -> None:
+    """key 启停落盘：文本级改写 + 备份 + 原子写（避免半程写坏）。"""
+    import shutil
+    from proxy_core.settings import CONFIG_FILE
+    new_text = _toggle_provider_key_in_text(
+        CONFIG_FILE.read_text(encoding="utf-8"), name, label, disabled)
+    bak = CONFIG_FILE.with_name(
+        f"{CONFIG_FILE.name}.bak-keytoggle-{time.strftime('%m%d-%H%M%S')}")
+    shutil.copy2(CONFIG_FILE, bak)
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, CONFIG_FILE)
+
+
+@bp.route("/provider/key/toggle", methods=["POST"])
+@check_admin_auth
+def api_provider_key_toggle():
+    """启用 / 停用静态 provider 的一个 API Key（按备注 label，热生效，F14）。
+
+    body: {"provider": "agnes", "label": "..."}（必填）+ 可选
+    "disabled": bool（缺省视为 True=停用；显式 false=启用）。停用的 key
+    保留在 config.json（不清除 key 本体）——额度耗尽的 key 先停用，待额度
+    重置再启用；停用期间不参与路由轮换（providers.pick_key 跳过），也不
+    计入面板 key_count。label 匹配口径与 key/remove 端点一致
+    （providers._parse_keys 归一化，含缺省 label）。provider 不存在 404；
+    atomcode/cline/minicode 等本地工具型通道 400 拒绝；label 不存在 404。
+    写 config.json 用文本级结构保留式（pricing 大小写折叠重复键不因回写
+    丢失），备份 config.json.bak-keytoggle-MMDD-HHMMSS 可恢复。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    name = str(data.get("provider") or "").strip()
+    label = str(data.get("label") or "").strip()
+    if not name or not label:
+        return jsonify({"error": "缺少 provider 或 label"}), 400
+    if "disabled" in data:
+        raw = data.get("disabled")
+        if isinstance(raw, bool):
+            disabled = raw
+        elif isinstance(raw, str):
+            disabled = raw.strip().lower() not in ("false", "0", "no", "")
+        else:
+            disabled = bool(raw)
+    else:
+        disabled = True  # 缺省视为停用
+    cfg = load_config()
+    provs = cfg.get("providers") or {}
+    p = provs.get(name)
+    if not isinstance(p, dict):
+        return jsonify({"error": f"provider「{name}」不存在"}), 404
+    ptype = p.get("type")
+    if ptype in ("atomcode", "cline", "minicode"):
+        kind = {"atomcode": "AtomCode 签名", "cline": "Cline 官方",
+                "minicode": "MiniCode（mcode）官方"}.get(ptype, ptype)
+        return jsonify({"error": f"provider「{name}」是{kind}通道，无静态 key"}), 400
+    if not any(e["label"] == label for e in providers._parse_keys(name, p)):
+        return jsonify({"error": f"key「{label}」不存在"}), 404
+    try:
+        _set_provider_key_disabled(name, label, disabled)
+    except (ValueError, OSError) as e:
+        log.error("provider「%s」key「%s」启停写盘失败: %s", name, label, e)
+        return jsonify({"error": f"写 config.json 失败: {e}"}), 500
+    providers.all_providers()  # 立即触发重载（mtime 热生效）
+    _provider_cache.update(ts=0, data=None)  # 击穿面板缓存，卡片即时反映
+    ents = providers._parse_keys(
+        name, (load_config().get("providers") or {}).get(name) or {})
+    kc = sum(1 for e in ents if not e.get("disabled"))
+    dc = sum(1 for e in ents if e.get("disabled"))
+    activity.add("info",
+                 f"Provider「{name}」key「{label}」"
+                 f"{'停用' if disabled else '启用'}（启用 {kc} / 停用 {dc}）",
+                 model=name)
+    return jsonify({"provider": name, "label": label,
+                    "disabled": bool(disabled),
+                    "key_count": kc, "key_disabled_count": dc})
+
+
 # ─── 一键探测上游可用模型（F2）────────────────────────────────
 # 卡片「探测模型」：GET {base_url}/models（带第一个 key）
 # 拿候选 → keyword 子串过滤（大小写不敏感）→ 最多探 40
@@ -1630,9 +2043,14 @@ def api_providers_info():
             "ok": False,
         }
         if prov.get("keys"):
-            item["key_count"] = len(prov["keys"])
+            # F14: key_count 只数参与路由的（未停用）key——路由真相；
+            # key_disabled_count 为停用数（额度耗尽先停用，面板显示"N 停用"）。
+            enabled_keys = [k for k in prov["keys"] if not k.get("disabled")]
+            item["key_count"] = len(enabled_keys)
+            item["key_disabled_count"] = len(prov["keys"]) - len(enabled_keys)
             item["key_entries"] = [
-                {"label": k["label"], "preview": _mask_key(k["key"])}
+                {"label": k["label"], "preview": _mask_key(k["key"]),
+                 "disabled": bool(k.get("disabled"))}
                 for k in prov["keys"]
             ]
         headers = {"Authorization": f"Bearer {prov['api_key']}", "Accept": "application/json"}
