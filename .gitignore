@@ -38,3 +38,7 @@ hunyuanocr/models/
 wb/accounts/
 conversations.json
 .pytest_cache/
+
+# multi-suffix logs (proxy.log.3 etc.)
+*.log.*
+_tmp_*.txt
