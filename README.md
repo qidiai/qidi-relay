@@ -1,4 +1,6 @@
 # QiDi Relay v4 — 局域网代理控制台（模块化重构版）
+> ⚠️ **许可协议 / License**: 本项目采用 [CC BY-NC 4.0](./LICENSE)（署名-非商业性使用 4.0 国际）——个人学习、研究、非商业用途可自由使用与修改；**未经作者书面授权，禁止任何商业用途**。/ This project is licensed under **CC BY-NC 4.0** — free for personal and noncommercial use; **commercial use is prohibited** without written permission.
+
 
 基于 v3 的完整重构：后端模块化拆分 + 全新 HUD 风格控制台前端。
 **数据文件（accounts.json / config.json / token_stats.json）与 v3 完全兼容。**
