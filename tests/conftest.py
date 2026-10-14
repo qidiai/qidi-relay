@@ -13,6 +13,8 @@ import pathlib
 import sys
 import tempfile
 
+import pytest
+
 # 跨目录修复（任务 0）：从其他目录跑
 # pytest <绝对路径>/tests 时 CWD 不是仓库根，
 # 必须先把仓库根塞进 sys.path 再 import，
@@ -25,3 +27,26 @@ import proxy_core.settings as S
 _S_TMP = pathlib.Path(tempfile.mkdtemp(prefix="qidi-affinity-conftest-"))
 S.CONVERSATIONS_FILE = _S_TMP / "conversations.json"
 S.COOLDOWNS_FILE = _S_TMP / "cooldowns.json"   # 冷却状态持久化（吸收-1 §R-A）
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_upstream_clients():
+    """R-B：清空 providers 的共享 Client 缓存（用例前后各一次）。
+
+    该缓存是模块级状态（(name, proxy_url) → httpx.Client）。多个测试文件
+    用 monkeypatch 换掉全局 httpx.Client（如 test_provider_headers 装
+    _RecordingClient），被换掉期间构造的**假 Client 会留在缓存里**并泄漏到
+    后续测试文件，表现为"上游返回被上一个文件的罐头响应替代"。转发路径
+    在真实运行中不会遇到这种情况（httpx.Client 是稳定的），但测试必须让
+    这份全局状态在用例边界归零——与各文件自行清 _prov_quota_cooldown /
+    affinity._TABLE 同纪律。
+    """
+    try:
+        import proxy_core.providers as _PV
+    except Exception:      # pragma: no cover - providers 导不进来时不该拖垮收集
+        yield
+        return
+    _PV.close_all_clients()
+    yield
+    _PV.close_all_clients()
+

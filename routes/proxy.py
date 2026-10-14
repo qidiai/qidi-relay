@@ -5,9 +5,11 @@
 - /health 返回版本与运行时长
 """
 
+import contextlib
 import json
 import hmac as hmac_mod
 import logging
+import queue
 import re
 import threading
 import time
@@ -27,6 +29,7 @@ from proxy_core import opencode
 from proxy_core import anthropic
 from proxy_core import affinity
 from proxy_core import budget
+from proxy_core import classify_failure
 from proxy_core import cooldown_store
 from proxy_core import corpus
 from proxy_core.accounts import AUTH_COOLDOWN_S, QUOTA_COOLDOWN_S
@@ -45,6 +48,7 @@ from proxy_core.settings import (
     get_vision_model,
     CONFIG_DUPLICATE_KEY_WARNINGS,
 )
+from proxy_core.settings import get_keepalive_seconds as settings_get_keepalive_seconds
 from proxy_core.state import SERVER_STARTED_AT, activity, am, api_cache, token_stats
 
 log = logging.getLogger("qidi-relay")
@@ -382,14 +386,20 @@ class _UpstreamOpen:
 
     ok=True 时持有 resp/client，交由吐流阶段（_stream_body）关闭；失败时本对象
     已自行关干净，只留状态码与错误摘要供选号循环决策。
+
+    client_shared（R-B）：client 来自 providers 的 (name, proxy_url) 共享缓存
+    ——close() 只关 resp，**不关** client（缓存所有，失效时由 _load_providers
+    统一 close 淘汰）。主池（_stream_open）每次新建 client，client_shared=False
+    （缺省），close() 语义与升级前逐字节一致。
     """
 
     def __init__(self, *, status: int = 0, resp=None, client=None,
                  snippet: str = "", retry_after: float | None = None,
-                 error: str | None = None):
+                 error: str | None = None, client_shared: bool = False):
         self.status = status
         self.resp = resp
         self.client = client
+        self.client_shared = client_shared
         self.snippet = snippet
         self.retry_after = retry_after
         self.error = error
@@ -420,13 +430,27 @@ class _UpstreamOpen:
         return self.error is not None or self.status in FAILOVER_UPSTREAM_STATUSES
 
     def close(self):
-        for res in (self.resp, self.client):
+        # R-B：共享 Client 归缓存所有——只关 resp，绝不关它（否则下一个
+        # 请求拿到的是已关闭的 Client）。非共享（主池）仍是 resp+client 双关。
+        targets = (self.resp,) if self.client_shared else (self.resp, self.client)
+        for res in targets:
             if res is None:
                 continue
             try:
                 res.close()
             except Exception:
                 pass
+
+
+@contextlib.contextmanager
+def _shared_client(pname: str, prov: dict):
+    """R-B：外部通道共享 Client 的 with 形态——块结束**不关闭**。
+
+    client 归 providers 的 (name, proxy_url) 缓存所有（trust_env=False），
+    失效时由 _load_providers 统一 close 淘汰。供既有 `with httpx.Client()`
+    结构最小改动替换用（语义等价于直接取用缓存句柄，块退出无副作用）。
+    """
+    yield providers.get_client(pname, prov.get("proxy_url"))
 
 
 def _parse_retry_after(raw) -> float | None:
@@ -525,6 +549,23 @@ def _feature_budget() -> bool:
             if isinstance(feats, dict) else True)
 
 
+def _rebind_on_failure(session_key, kind) -> None:
+    """失败面 → 绑定处置接线（吸收-1/2 §R-D）。
+
+    quota 档按 kind（classify_failure.HARD/TRANSIENT）决定"持久清绑定"
+    还是"保持绑定"；default 档 on_failure 恒零动作（现状：失败不动绑定）。
+    异常一律吞掉只告警——粘性记忆是良性可丢状态，绝不能因为绑定维护
+    把请求链路炸掉。
+    """
+    if not session_key:
+        return
+    try:
+        affinity.on_failure(session_key, kind)
+    except Exception as e:   # pragma: no cover - 绑定维护绝不阻断转发
+        log.warning("rebind 处置失败（session=%s, kind=%s）: %s",
+                    session_key, kind, e)
+
+
 # debug_last_request 互斥警示（T9 P2-6）：该调试开关
 # 把 /v1/chat/completions 的完整请求体原文写入
 # last_request.json——未脱敏，与语料 redact 管线互斥，
@@ -592,6 +633,57 @@ def _gate_saw_finish(obj: dict) -> bool:
                for c in choices)
 
 
+class _GateSignal(str):
+    """门内信号（吸收-1/2 §R-D F-2 改造）。
+
+    是 str 子类——与 "content"/"error"/"terminator"/"none" 的比较语义
+    完全不变（既有调用方与 test_channel_gate 的等值断言零改动），额外
+    携带 inband error 的 **status/载荷**：分类器（classify_failure）才
+    有数据分 429（hard）与 5xx（transient）。
+
+    str 子类 + __slots__ 是这里唯一能同时满足"签名不变"与"载荷传出"
+    的形态：改成元组会破坏 `_gate_classify(...) == "error"` 的既有契约。
+    """
+
+    __slots__ = ("error_status", "error_payload")
+
+    def __new__(cls, value, error_status=None, error_payload=None):
+        obj = super().__new__(cls, value)
+        obj.error_status = error_status
+        obj.error_payload = error_payload
+        return obj
+
+
+def _gate_error_status(err: dict):
+    """从流内 error 对象尽力提取 HTTP 形状态码（§R-D F-2）。
+
+    上游错误帧形态很杂：OpenAI 形 `error.code` 可能是 int（429）或
+    字符串（"429"/"rate_limit_exceeded"），也可能把状态放在
+    `error.status`/`error.http_status`，或只在 `error.type` 里带
+    "server_error"/"5xx"。逐候选取第一个"像 HTTP 状态码"的值
+    （100..599 的 int 或纯数字串）。**取不到返回 None**——分类器对
+    None 按 transient 保守处理（绝不因为帧里没写状态码就误清绑定）。
+    """
+    if not isinstance(err, dict):
+        return None
+    for k in ("code", "status", "http_status", "status_code"):
+        v = err.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int) and 100 <= v <= 599:
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if s.isdigit() and 100 <= int(s) <= 599:
+                return int(s)
+    t = err.get("type")
+    if isinstance(t, str):
+        m = re.search(r"\b([1-5]\d\d)\b", t)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def _gate_classify(line: str) -> str:
     """判定单条 data: 行的门内信号（调用方保证以 "data:" 开头）。
 
@@ -599,6 +691,9 @@ def _gate_classify(line: str) -> str:
     "terminator"（[DONE] 或 finish_reason，终止信号）/ "none"（无信号，
     如纯 usage 帧）。JSON 解析失败按无信号处理（与 _stream_body 的
     errors="ignore" 同风格：坏行不炸，只是不参与判定）。
+
+    §R-D F-2：error 分支返回 _GateSignal（str 子类，== "error" 不变），
+    其上挂 error_status/error_payload——判负路径据此二次归类 429 vs 5xx。
     """
     payload = line[5:].strip()
     if payload == "[DONE]":
@@ -611,12 +706,28 @@ def _gate_classify(line: str) -> str:
         return "none"
     err = obj.get("error")
     if isinstance(err, dict) and err:
-        return "error"
+        return _GateSignal("error", _gate_error_status(err), err)
     if _gate_has_content(obj):
         return "content"
     if _gate_saw_finish(obj):
         return "terminator"
     return "none"
+
+
+def _reason_text(reason) -> str:
+    """peek 判负 reason → 可供日志/面板/快照使用的文本。
+
+    兼容两种形态：既有字符串（"empty_stream"/"peek_error: …"）与
+    §R-D F-2 改造后的元组（("inband_error", status)）。snippet 字段
+    必须是字符串（_UpstreamOpen.access_denied 对片段做子串匹配）。
+    """
+    if isinstance(reason, tuple):
+        if not reason:
+            return ""
+        kind = str(reason[0])
+        status = reason[1] if len(reason) > 1 else None
+        return f"{kind}:{status}" if status else kind
+    return str(reason)
 
 
 def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
@@ -651,12 +762,12 @@ def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
     no_content_deadline = None
     stream_iter = None
 
-    def _finish_bad(reason: str):
+    def _finish_bad(reason):
         # 释放对已关流生成器的悬挂引用（判负路径 opened 已关，
         # peek_iter 再指向它只是拖延垃圾回收）
         opened.peek_iter = None
         opened.close()
-        log.warning("流内嗅探判负（%s，账号 %s）: %s", model, uid, reason)
+        log.warning("流内嗅探判负（%s，账号 %s）: %s", model, uid, _reason_text(reason))
         return ("bad", [], reason)
 
     try:
@@ -683,8 +794,11 @@ def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
                 if signal == "content":
                     return ("ok", prefetched, "")
                 if signal == "error":
-                    # 流内 error 帧：200 是假的，判负换号
-                    return _finish_bad("inband_error")
+                    # 流内 error 帧：200 是假的，判负换号。
+                    # §R-D F-2：reason 带 (inband_error, status)——分类器
+                    # 据此分 429（hard，清绑定）与 5xx（transient，保绑定）
+                    return _finish_bad((classify_failure.INBAND_ERROR,
+                                        getattr(signal, "error_status", None)))
                 if signal == "terminator":
                     saw_terminator = True
                 if saw_terminator:
@@ -713,7 +827,9 @@ def _peek_stream(opened: _UpstreamOpen, *, model: str, uid: str):
             if signal == "content":
                 return ("ok", prefetched, "")
             if signal == "error":
-                return _finish_bad("inband_error")
+                # 尾部残余 error 帧：同上方（§R-D F-2 带 status）
+                return _finish_bad((classify_failure.INBAND_ERROR,
+                                    getattr(signal, "error_status", None)))
             if signal == "terminator":
                 saw_terminator = True
         return _finish_bad("empty_stream")
@@ -753,6 +869,20 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     assistant 输出流，成功收尾（saw_done 且无异常——与
     下方"成功才记忆"同判据）后组样本入队；None = 采集
     关闭（零开销：不建 tap、不进采集分支）。
+
+    R-C SSE 心跳（吸收-1/2 §R-C）：阻塞迭代下"距上次 chunk 超时 yield
+    心跳"不可行——httpx 的 ReadTimeout 是致命的且抛出后流不可续读。故
+    改为主生成器 + **后台读线程 + Queue**：
+      · 读线程只做 next(stream_iter) → q.put(("c", chunk))，异常经队列
+        传回（("e", exc)），末尾 ("d", None) 收尾；
+      · 主生成器 q.get(timeout=keepalive) 阻塞，Queue.Empty → yield
+        ": keepalive\\n\\n" 后**继续等同一队列**（同一上游连接不中断）；
+      · 超时只影响心跳节奏，不重置 peek 门的 GATE_NO_EVENT_TIMEOUT
+        （正交设计保留：门死限是 peek 阶段内部的独立刹车）；
+      · GeneratorExit/客户端断开：abort 置位 + opened.close()（关 resp
+        触发读取异常）→ 读线程退出，无泄漏；
+      · keepalive_seconds=0（关闭）时走原阻塞 for 循环，行为与升级前
+        逐字节一致（回滚路径）。
     """
     usage_captured = None
     line_buf = ""
@@ -860,6 +990,32 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
                                             and ttft_text_ms is None):
                                         ttft_text_ms = now_ms
 
+    # R-C：心跳节奏（读一次；0=关，走原阻塞路径）
+    keepalive_s = settings_get_keepalive_seconds()
+    keepalives = 0
+    abort = threading.Event()
+    q = None
+
+    def _pump_stream(stream_iter, out_q):
+        """后台读线程（R-C）：只做 next() + q.put，绝不 yield。
+
+        队列载荷三态：("c", chunk) 数据块 / ("e", exc) 读流异常
+        （主生成器 raise 后走既有 except 分支如实收尾）/ ("d", None)
+        流结束。abort 置位（GeneratorExit/客户端断开）后立即停止取下一块
+        ——配合 finally 里的 opened.close()（关 resp 触发读取异常）双保险。
+        """
+        try:
+            while not abort.is_set():
+                try:
+                    chunk = next(stream_iter)
+                except StopIteration:
+                    break
+                out_q.put(("c", chunk))
+        except Exception as e:
+            out_q.put(("e", e))
+        finally:
+            out_q.put(("d", None))
+
     try:
         if prefetched is not None:
             # 嗅探门预读的字节先原样吐出
@@ -873,9 +1029,32 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
         stream_iter = getattr(opened, "peek_iter", None)
         if stream_iter is None:
             stream_iter = opened.resp.iter_bytes()
-        for chunk in stream_iter:
-            _consume_chunk(chunk)
-            yield chunk
+        if keepalive_s > 0:
+            # R-C：后台读线程 + Queue（阻塞迭代下唯一能"边等边上心跳"
+            # 的形态）。q 无界——读线程的 put 永不阻塞，杜绝双向等待。
+            q = queue.Queue()
+            threading.Thread(target=_pump_stream, args=(stream_iter, q),
+                             daemon=True, name="relay-stream-pump").start()
+            while True:
+                try:
+                    kind, payload = q.get(timeout=keepalive_s)
+                except queue.Empty:
+                    # 上游静默：发心跳保活，**继续等同一队列**
+                    # （同一个上游连接不中断，也不重置门死限）
+                    keepalives += 1
+                    yield b": keepalive\n\n"
+                    continue
+                if kind == "d":
+                    break
+                if kind == "e":
+                    raise payload        # 交给下方既有 except 分支收尾
+                _consume_chunk(payload)
+                yield payload
+        else:
+            # 关闭分支（keepalive_seconds=0）：与升级前逐字节一致
+            for chunk in stream_iter:
+                _consume_chunk(chunk)
+                yield chunk
         if line_buf:
             u = _extract_usage_from_line(line_buf)
             if u:
@@ -884,16 +1063,27 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
             # 上游没吐终止符就断了 socket：httpx 只看到正常 EOF，只能靠契约判断
             log.warning("上游流未以 [DONE] 收尾（账号 %s，%s），回复可能被截断", uid, model)
             activity.add("warn", f"{model} · 账号 {uid} 流未以 [DONE] 收尾，疑似截断",
-                         model=model, user_id=uid, status="截断")
+                         model=model, user_id=uid, status="截断",
+                         keepalives=keepalives)
+            # §R-D：截断 = transient（本次 failover/如实收尾，绑定保持）
+            if session_key:
+                _rebind_on_failure(session_key, classify_failure.TRANSIENT)
     except Exception as e:
         log.error("流式中断（账号 %s）: %s", uid, e)
         latency_ms = int((time.perf_counter() - started) * 1000)
         activity.add("error", f"{model} · 账号 {uid} 流式中断: {e}", model=model,
-                     user_id=uid, latency_ms=latency_ms, tokens=0, status="流中断")
+                     user_id=uid, latency_ms=latency_ms, tokens=0, status="流中断",
+                     keepalives=keepalives)
+        # §R-D：流内异常（连接断/读超时）= transient
+        if session_key:
+            _rebind_on_failure(session_key, classify_failure.TRANSIENT)
         yield (f'data: {json.dumps({"error": {"message": f"upstream stream interrupted: {e}", "type": "proxy_stream_error"}}, ensure_ascii=False)}\n\n').encode()
         yield b"data: [DONE]\n\n"
         return
     finally:
+        # R-C：先置 abort 再关 resp——读线程要么立刻看到 abort 退出，
+        # 要么被关 resp 触发的读取异常掀出（双保险，daemon 兜底）
+        abort.set()
         registry.finish(rid, "done")
         opened.close()
         if sess is not None:
@@ -915,9 +1105,11 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
     # 记忆"语义）；except 分支已 return 提前退出，天然
     # 不达此处。外部三通道不传 session_key → 不记录
     # （粘性作用域仅主池）。
+    # §R-D F-1：quota 档走 record_success 准入——仅"命中绑定账号且成功"
+    # 才覆写绑定；failover 到非绑定账号成功时不覆写（default 档等价原 record）。
     if session_key and saw_done:
-        affinity.record(session_key, uid, model, usage_captured,
-                        turn_boundary)
+        affinity.record_success(session_key, uid, model, usage_captured,
+                                turn_boundary)
     # 知识库记录（0905）：流式成功
     kdb.record_request(
         user_id=uid, model_requested=model,
@@ -949,7 +1141,10 @@ def _stream_body(opened: _UpstreamOpen, model: str, uid: str, started: float,
             body_truncated=tap.truncated)
     activity.add("ok", f"{model} · 账号 {uid}（流式）", model=model, user_id=uid,
                  latency_ms=latency_ms,
-                 tokens=(usage_captured or {}).get("total_tokens", 0), status=200)
+                 tokens=(usage_captured or {}).get("total_tokens", 0), status=200,
+                 # R-C 观测：心跳**不逐条**进 ActivityLog（deque maxlen=200
+                 # 会被挤出真实动态）——按流聚合计数汇总进本请求的动态条目。
+                 keepalives=keepalives)
 
 
 def _openai_error(message: str, err_type: str, code: str, status: int = 503,
@@ -1358,12 +1553,18 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                         # 可能被误判，拖进冷却会造成级联耗竭）。
                         # opened 已在 _peek_stream 判负分支内关闭，
                         # 此处不再重复 close，避免双重 close。
+                        # §R-D：按失败面归类处置绑定（quota 档才生效；
+                        # default 档 on_failure 恒零动作）。
+                        _rebind_on_failure(
+                            affinity_skey,
+                            classify_failure.classify_peek_reason(reason))
                         session_pool.release(sess)
-                        last_open = _UpstreamOpen(error=f"gate: {reason}",
-                                                  snippet=reason)
+                        last_open = _UpstreamOpen(
+                            error=f"gate: {_reason_text(reason)}",
+                            snippet=_reason_text(reason))
                         last_uid = uid
                         activity.add("warn",
-                                     f"{model} · 账号 {uid} 流内嗅探判负({reason})，换号",
+                                     f"{model} · 账号 {uid} 流内嗅探判负({_reason_text(reason)})，换号",
                                      model=model, user_id=uid, status="gate")
                         continue
                     # 判健康：peek rid 立即终结（"peek"）——吐流
@@ -1388,6 +1589,12 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
             session_pool.release(sess)
             last_open, last_uid = opened, uid
             _penalize_account(uid, opened, model)
+            # §R-D：开闸失败（连接层异常 / 失败状态码）按状态码归类，
+            # 连接层异常（status=0）→ transient（on_failure 兜底）
+            _rebind_on_failure(affinity_skey,
+                              classify_failure.classify_open_error(opened.error)
+                              if opened.error is not None
+                              else classify_failure.classify_http_status(opened.status))
             if not opened.failover:
                 return _upstream_fail_response(opened, model, uid, started)
             log.warning("流式账号 %s 失败（%s），换下一账号", uid,
@@ -1424,6 +1631,10 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                                            retry_after=_parse_retry_after(
                                                r.headers.get("retry-after")))
                     _penalize_account(uid, opened, model)
+                    # §R-D：401/402/403 = 认证/配额族 → hard（quota 档清绑定）
+                    _rebind_on_failure(
+                        affinity_skey,
+                        classify_failure.classify_http_status(r.status_code))
                     last_open, last_uid = opened, uid
                     session_pool.release(sess)
                     # 与流式同一条 failover 判定（0929：access_denied 也换号再试）
@@ -1436,6 +1647,10 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                     log.error("上游返回 %s: %s", r.status_code, r.text[:800])
                     activity.add("error", f"{model} · 账号 {uid} 上游返回 {r.status_code}",
                                  model=model, user_id=uid, latency_ms=latency_ms, tokens=0, status=r.status_code)
+                    # §R-D：429/404（CPA 源硬判据）→ hard；5xx/408 → transient
+                    _rebind_on_failure(
+                        affinity_skey,
+                        classify_failure.classify_http_status(r.status_code))
                     session_pool.release(sess)
                     return Response(r.content, status=r.status_code,
                                     content_type=r.headers.get("content-type", "application/json"))
@@ -1451,6 +1666,11 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                         snippet=json.dumps(resp_json["error"],
                                            ensure_ascii=False)[:800])
                     last_uid = uid
+                    # §R-D：非流式 inband error 同样按载荷状态码二次归类
+                    _rebind_on_failure(
+                        affinity_skey,
+                        classify_failure.classify_http_status(
+                            _gate_error_status(resp_json["error"])))
                     session_pool.release(sess)
                     activity.add("warn",
                                  f"{model} · 账号 {uid} 非流式响应流内错误，换号",
@@ -1461,10 +1681,13 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                     token_stats.record(uid, model, usage)
                     _record_key_usage(model, usage)
                 # 会话粘性记录（阶段 B / 方案 §4，v1 仅主池）：
-                # 非流式在 usage 记账处同样调用
+                # 非流式在 usage 记账处同样调用。
+                # §R-D F-1：quota 档走 record_success 准入——仅"命中绑定
+                # 账号且成功"才覆写绑定，failover 到非绑定账号成功时保持
+                # 原绑定（default 档等价于原 affinity.record）。
                 if affinity_skey:
-                    affinity.record(affinity_skey, uid, model, usage,
-                                    affinity_turn)
+                    affinity.record_success(affinity_skey, uid, model, usage,
+                                            affinity_turn)
                 # 知识库记录（0905）：非流式池成功
                 kdb.record_request(
                     user_id=uid, model_requested=model,
@@ -1499,6 +1722,10 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
                          model=model, user_id=acc.get("user_id", "?"),
                          latency_ms=int((time.perf_counter() - started) * 1000),
                          tokens=0, status="异常")
+            # §R-D：连接层/解析类异常 → transient（绑保持；带
+            # invalid_grant 语义的认证族异常由 classify_open_error 归 hard）
+            _rebind_on_failure(affinity_skey,
+                              classify_failure.classify_open_error(e))
             session_pool.release(sess)
             continue
 
@@ -1857,7 +2084,9 @@ def _forward_cline(data: dict, model: str, prov: dict):
     # ── 流式 ─────────────────────────────────────────────────
     if is_stream:
         client_key_label = getattr(g, "api_key_label", None) if has_request_context() else None
-        client = httpx.Client()
+        # R-B：共享 Client（按 (provider, proxy_url) 缓存 + trust_env=False）。
+        # 生命周期归 providers 缓存所有——本函数绝不 close 它。
+        client = providers.get_client(pname, prov.get("proxy_url"))
         r = None
         ch = None
         last_status, last_snippet = 0, ""
@@ -1921,7 +2150,7 @@ def _forward_cline(data: dict, model: str, prov: dict):
                             activity.add(
                                 "warn",
                                 f"{model} · 通道 {ch.label} 流内嗅探判负"
-                                f"（{reason}），换通道",
+                                f"（{_reason_text(reason)}），换通道",
                                 model=model, user_id=ch.label,
                                 status="gate")
                             # 复位：对齐 external（防同一请求
@@ -1938,6 +2167,7 @@ def _forward_cline(data: dict, model: str, prov: dict):
                         # 一致）
                         registry.finish(peek_rid, "peek")
                         gate_opened.client = client
+                        gate_opened.client_shared = True   # R-B：共享 Client 不随流关闭
                         break
                     break
                 status = r.status_code
@@ -1954,12 +2184,10 @@ def _forward_cline(data: dict, model: str, prov: dict):
                     continue
                 # 换号无益的错误（400/403/404…）：如实透传
                 log.error("[cline] 上游流式返回 %s: %s", status, snippet)
-                client.close()
                 return _openai_error(
                     f"upstream returned {status} for model '{model}': {snippet[:300]}",
                     "proxy_upstream_error", f"upstream_{status}", status)
             if r is None or r.status_code != 200:
-                client.close()
                 activity.add("error", f"{model} · {pname} 上游不可用（{last_status or '全冷却'}）",
                              model=model, user_id=pname,
                              latency_ms=int((time.perf_counter() - started) * 1000),
@@ -1979,7 +2207,7 @@ def _forward_cline(data: dict, model: str, prov: dict):
                 # 门关（或本轮未走到门）：与升级前逐字节一致
                 gate_opened = _UpstreamOpen(
                     status=200, resp=cline.ClineStreamWrap(r, model),
-                    client=client)
+                    client=client, client_shared=True)   # R-B：共享 Client
             # 判健康时 gate_opened 已带 prefetched（peek 预读
             # 字节，客户端一个都不丢）+ peek_iter（httpx 流
             # 只能完整迭代一次，续读必须复用同一生成器）
@@ -1990,7 +2218,6 @@ def _forward_cline(data: dict, model: str, prov: dict):
                              budget_release=_g_budget_release()),
                 content_type="text/event-stream")
         except Exception as e:
-            client.close()
             log.error("[cline] %s 请求失败: %s", pname, e)
             return jsonify({"error": f"{pname} 请求失败: {e}"}), 502
 
@@ -2002,7 +2229,8 @@ def _forward_cline(data: dict, model: str, prov: dict):
     ch_used = None
     last_status, last_snippet = 0, ""
     try:
-        with httpx.Client() as client:
+        # R-B：共享 Client（with 形态——块结束不关闭，见 _shared_client）
+        with _shared_client(pname, prov) as client:
             for _attempt in range(attempts):
                 ch = _pick()
                 if ch is None:
@@ -2204,7 +2432,9 @@ def _forward_minicode(data: dict, model: str, prov: dict):
     # ─── 流式 ─────────────────────────────────────────────────────────────────
     if is_stream:
         client_key_label = getattr(g, "api_key_label", None) if has_request_context() else None
-        client = httpx.Client()
+        # R-B：共享 Client（按 (provider, proxy_url) 缓存 + trust_env=False）。
+        # 生命周期归 providers 缓存所有——本函数绝不 close 它。
+        client = providers.get_client(pname, prov.get("proxy_url"))
         r = None
         ch = None
         last_status, last_snippet = 0, ""
@@ -2269,7 +2499,7 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                             activity.add(
                                 "warn",
                                 f"{model} · 通道 {ch.label} 流内嗅探判负"
-                                f"（{reason}），换通道",
+                                f"（{_reason_text(reason)}），换通道",
                                 model=model, user_id=ch.label,
                                 status="gate")
                             # 复位：对齐 external（防同一请求
@@ -2286,6 +2516,7 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                         # 一致）
                         registry.finish(peek_rid, "peek")
                         gate_opened.client = client
+                        gate_opened.client_shared = True   # R-B：共享 Client 不随流关闭
                         break
                     break
                 status = r.status_code
@@ -2301,12 +2532,10 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                     r = None
                     continue
                 log.error("[minicode] 流式错误 %s: %s", status, snippet)
-                client.close()
                 return _openai_error(
                     f"upstream returned {status} for model '{model}': {snippet[:300]}",
                     "proxy_upstream_error", f"upstream_{status}", status)
             if r is None or r.status_code != 200:
-                client.close()
                 activity.add("error", f"{model} @ {pname} 多通道不可用（{last_status or '全部冷却'}）",
                              model=model, user_id=pname,
                              latency_ms=int((time.perf_counter() - started) * 1000),
@@ -2327,7 +2556,7 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                 gate_opened = _UpstreamOpen(
                     status=200,
                     resp=minicode.MiniCodeStreamWrap(r, model),
-                    client=client)
+                    client=client, client_shared=True)   # R-B：共享 Client
             # 判健康时 gate_opened 已带 prefetched（peek 预读
             # 字节，客户端一个都不丢）+ peek_iter（httpx 流
             # 只能完整迭代一次，续读必须复用同一生成器）
@@ -2338,7 +2567,6 @@ def _forward_minicode(data: dict, model: str, prov: dict):
                              budget_release=_g_budget_release()),
                 content_type="text/event-stream")
         except Exception as e:
-            client.close()
             log.error("[minicode] %s 流式失败: %s", pname, e)
             return jsonify({"error": f"{pname} 流式失败: {e}"}), 502
 
@@ -2348,7 +2576,8 @@ def _forward_minicode(data: dict, model: str, prov: dict):
     ch_used = None
     last_status, last_snippet = 0, ""
     try:
-        with httpx.Client() as client:
+        # R-B：共享 Client（with 形态——块结束不关闭，见 _shared_client）
+        with _shared_client(pname, prov) as client:
             for _attempt in range(attempts):
                 ch = _pick()
                 if ch is None:
@@ -2721,7 +2950,10 @@ def _forward_external(data: dict, model: str, prov: dict):
                 生成器）；凭证全部不可用（签名失败 / 每个 key 都被拒 /
                 全部被嗅探门判负）返回 None。
                 """
-                client = httpx.Client()
+                # R-B：共享 Client（按 (provider, proxy_url) 缓存，
+                # trust_env=False）。生命周期归 providers 缓存所有——
+                # 本函数与 _stream_body 都绝不 close 它。
+                client = providers.get_client(pname, prov.get("proxy_url"))
                 tried = set()
                 key_label = pname
                 gate_opened = None
@@ -2789,7 +3021,7 @@ def _forward_external(data: dict, model: str, prov: dict):
                                     activity.add(
                                         "warn",
                                         f"{model} · {key_label} 流内嗅探判负"
-                                        f"（{reason}），换 key",
+                                        f"（{_reason_text(reason)}），换 key",
                                         model=model, user_id=key_label,
                                         status="gate")
                                     gate_opened = None
@@ -2804,6 +3036,7 @@ def _forward_external(data: dict, model: str, prov: dict):
                                 # finally 收尾（与无门时一致）
                                 registry.finish(peek_rid, "peek")
                                 gate_opened.client = client
+                                gate_opened.client_shared = True   # R-B：共享 Client 不随流关闭
                                 return (r, key_label, client,
                                         gate_opened, gate_prefetched)
                             return r, key_label, client, None, None
@@ -2811,10 +3044,9 @@ def _forward_external(data: dict, model: str, prov: dict):
                         log.warning("[%s] key %s 流式连接返回 %s，换下一个 key: %s",
                                     pname, key_label, r.status_code, err_body[:200])
                         r.close()
-                    client.close()
+                    # R-B：client 是共享缓存的，绝不在此 close
                     return None
                 except Exception:
-                    client.close()
                     raise
 
             result = _open_stream()
@@ -2835,7 +3067,8 @@ def _forward_external(data: dict, model: str, prov: dict):
                              model=model, user_id=key_label,
                              latency_ms=int((time.perf_counter() - started) * 1000),
                              tokens=0, status=status)
-                opened = _UpstreamOpen(status=status, resp=r, client=client)
+                opened = _UpstreamOpen(status=status, resp=r, client=client,
+                                       client_shared=True)   # R-B：共享 Client
                 opened.close()
                 # 0929：全部 key 均配额耗尽 → provider 级冷却，后续请求快速失败
                 if status == 429 and ("quota" in snippet.lower() or not snippet):
@@ -2852,7 +3085,8 @@ def _forward_external(data: dict, model: str, prov: dict):
             load_key = f"key:{pname}|{key_label}" if not is_ac else f"ac:{pname}|{key_label}"
             if gate_opened is None:
                 # 门关（或本轮未走到门）：与升级前逐字节一致
-                gate_opened = _UpstreamOpen(status=200, resp=r, client=client)
+                gate_opened = _UpstreamOpen(status=200, resp=r, client=client,
+                                           client_shared=True)   # R-B：共享 Client
             # 判健康时 gate_opened 已带 prefetched（peek 预读
             # 字节，客户端一个都不丢）+ peek_iter（httpx 流
             # 只能完整迭代一次，续读必须复用同一生成器）
@@ -2867,31 +3101,37 @@ def _forward_external(data: dict, model: str, prov: dict):
         r = None
         tried = set()
         key_label = pname
-        with httpx.Client() as client:
-            for attempt in range(attempts):
-                if is_ac:
-                    ch = pick_channel(pname, exclude=tried or None)
-                    if ch is None:
-                        break
-                    tried.add(ch.label)
-                    key_label = ch.label if n_channels > 1 else pname
-                    try:
-                        hdrs = ch.sign_headers("POST", sign_path, body)
-                    except Exception as e:
-                        log.warning("[atomcode] %s 签名失败，换下一个账号: %s", ch.label, e)
-                        continue
-                else:
-                    entry = providers.pick_key(prov, exclude=tried or None)
-                    if entry is None:
-                        break
-                    tried.add(entry["key"])
-                    key_label = entry["label"] if n_keys > 1 else pname
-                    hdrs = _headers_for(entry)
-                r = client.post(url, **body_kwargs, headers=hdrs, timeout=300)
-                if r.status_code == 200 or r.status_code not in retryable \
-                        or attempt == attempts - 1:
+        # R-B：共享 Client（不随请求块结束关闭——缓存所有，须用 try/finally
+        # 而非 with，否则每个非流式请求都会关掉其他请求正在用的连接池）。
+        # 非流式连接超时同步收敛（原 timeout=300 标量：配坏代理最长挂 5min，
+        # 与流式 connect=15 口径对齐；read 保持 300 不缩短长生成）。
+        client = providers.get_client(pname, prov.get("proxy_url"))
+        for attempt in range(attempts):
+            if is_ac:
+                ch = pick_channel(pname, exclude=tried or None)
+                if ch is None:
                     break
-                log.warning("[%s] key %s 返回 %s，换下一个 key", pname, key_label, r.status_code)
+                tried.add(ch.label)
+                key_label = ch.label if n_channels > 1 else pname
+                try:
+                    hdrs = ch.sign_headers("POST", sign_path, body)
+                except Exception as e:
+                    log.warning("[atomcode] %s 签名失败，换下一个账号: %s", ch.label, e)
+                    continue
+            else:
+                entry = providers.pick_key(prov, exclude=tried or None)
+                if entry is None:
+                    break
+                tried.add(entry["key"])
+                key_label = entry["label"] if n_keys > 1 else pname
+                hdrs = _headers_for(entry)
+            r = client.post(url, **body_kwargs, headers=hdrs,
+                            timeout=httpx.Timeout(connect=15, read=300,
+                                                  write=180, pool=15))
+            if r.status_code == 200 or r.status_code not in retryable \
+                    or attempt == attempts - 1:
+                break
+            log.warning("[%s] key %s 返回 %s，换下一个 key", pname, key_label, r.status_code)
         if r is None:
             if is_ac:
                 return jsonify({"error": f"AtomCode 所有账号凭证均不可用",
@@ -3257,6 +3497,12 @@ def v1_responses():
                 for piece in inner.response:
                     for line in piece.decode("utf-8", errors="replace").splitlines():
                         line = line.strip()
+                        if line.startswith(":"):
+                            # R-C 心跳透传：SSE 注释行原样放行（"data:" 前缀
+                            # 判定会把注释吞掉，主力客户端就用不上心跳了）。
+                            # 注释是 SSE 协议保留形态，客户端一律忽略。
+                            yield line + "\n\n"
+                            continue
                         if not line.startswith("data:"):
                             continue
                         payload = line[5:].strip()
@@ -3447,6 +3693,13 @@ def v1_anthropic_messages():
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         line = line.strip()
+                        if line.startswith(":"):
+                            # R-C 心跳透传：SSE 注释行（": keepalive"）原样
+                            # 放行——原先只认 "data:" 前缀会把注释整条吞掉。
+                            # 放在 done 判定之前：终止符之后到达的收尾心跳
+                            # 同样无害（SSE 注释不产生任何事件）。
+                            yield line + "\n\n"
+                            continue
                         if not line.startswith("data:") or done:
                             continue
                         payload = line[5:].strip()

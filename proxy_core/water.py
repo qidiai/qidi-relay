@@ -305,7 +305,16 @@ class WaterCheck:
 
         mismatched_names, prompts_tokens = set(), []
         try:
-            with httpx.Client() as client:
+            # R-B：金丝雀探针同样走 per-provider 代理出口（外部 provider
+            # 被 IP 风控时探针与转发必须同源，否则探针误报"不可用"）。
+            # 池探针（kind=="pool"）是主池路径，不属外部 provider，直连
+            # （池出口若需代理由全局 requests.proxy_url 兜底，本批不动）。
+            if kind == "provider":
+                from . import providers as _providers   # 函数内导入：防环
+                client_ctx = _providers.make_client(obj)
+            else:
+                client_ctx = httpx.Client()
+            with client_ctx as client:
                 for c in CANARIES:
                     body = {
                         "model": model,

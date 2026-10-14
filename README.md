@@ -47,6 +47,9 @@ web/
 | Cline 官方通道 | provider `"type": "cline"`：凭证跟随 Cline 客户端登录态（providers.json mtime 感知）、token 过期自动刷新并原子回写、客户端指纹头、免费模型串行门 + 429 冷却解析 |
 | MiniCode 官方通道 | provider `"type": "minicode"`（2026-10-01）：MiniMax mcode 登录态反代（`~/.minimax/auth/prod/cn/mcode-public/auth.json`，mtime 感知），上游 Anthropic Messages 协议自动转 OpenAI；token 短时效自动 OAuth 刷新（refresh_token 轮换立即落盘，generation 不动与官方客户端共存）；模型 `mcode-m3`（512K/图像输入/thinking 可关）/ `mcode-m3.1-flash`（effort 档位）/ `mcode-m2.7-highspeed` / `mcode-m2.7`；429 冷却解析、瞬时 400 限次重试、管理面板通道状态 |
 | Anthropic 型号别名 | config.json 的 `anthropic_model_aliases` 把客户端内置型号名（`claude-*`）收编到中转真实模型，仅 `/v1/messages` 生效 |
+| 每渠道代理出口 | `providers.<name>.proxy_url`（吸收-1/2 §R-B）：http/https/socks5 三种代理，空=回退全局 `requests.proxy_url`，`"direct"`=显式直连覆盖全局。转发、面板「探测模型」、注水探针三处出口一致；所有按 provider 构造的连接 `trust_env=False`（不吃 HTTP(S)_PROXY 环境变量，`direct` 语义才成立）。用例：某上游按家庭宽带出口 IP 403 时只给该渠道挂代理，其余渠道不动。socks5 需 `socksio`（安装器已带 `httpx[socks]`） |
+| SSE 心跳保活 | `requests.keepalive_seconds`（吸收-1/2 §R-C，默认 15 秒开启）：上游思考型模型 prefill 静默期不吐字节时，每 N 秒下发一条 SSE 注释行 `: keepalive` 防中间层/客户端掐连接；`0` = 关闭（回滚开关）。实现为「后台读线程 + Queue」，同一上游连接不中断；心跳不混入数据帧、不重置流内嗅探门死限；`/v1/messages` 与 `/v1/responses` 两桥对 `:` 注释行原样透传（Claude Code 等主力客户端可见）；每流心跳次数聚合进该请求的动态条目（`keepalives` 字段），不逐条灌 `ActivityLog` |
+| 会话粘性失败分级 | `routing.rebind_on`（吸收-1/2 §R-D）：`"default"`（缺省）= 现状零改动（成功者覆写绑定、失败不动绑定）；`"quota"` = CPA 语义——transient 失败（读超时/连接重置/5xx/空流/截断）本次换号但**保持绑定**（保 prompt cache），hard 失败（401/402/403/429/404/budget_exhausted/OAuth invalid_grant）**持久清绑定**，且仅「命中绑定账号且成功」才覆写绑定。失败面×归类映射见 `proxy_core/classify_failure.py`；观测见 `GET /api/affinity/stats` 的 `rebind_distribution` |
 | 渠道接入示例 | apigoto 聚合网关完整接入步骤（面板添加 / config 手写 / 多 Key 轮换 / 停用启用）见 [docs/apigoto.md](docs/apigoto.md) |
 
 ## 启动

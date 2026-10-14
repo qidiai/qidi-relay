@@ -4,10 +4,11 @@ cd /d %~dp0
 title Codely Relay - 局域网代理
 
 REM 首次运行自动安装依赖（已装则秒过）
-py -3 -c "import flask, httpx" >nul 2>&1
+REM 吸收-1/2 §R-B：httpx[socks] —— socks5 代理出口需要 socksio
+py -3 -c "import flask, httpx, socksio" >nul 2>&1
 if errorlevel 1 (
-  echo 首次运行，正在安装依赖 flask httpx ...
-  py -3 -m pip install -q flask httpx -i https://pypi.tuna.tsinghua.edu.cn/simple
+  echo 首次运行，正在安装依赖 flask httpx[socks] ...
+  py -3 -m pip install -q flask "httpx[socks]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 )
 
 echo ============================================

@@ -15,6 +15,15 @@
     "codely-vl"
   ],
   "_vision_说明": "收到图片/音频等媒体内容时，若目标模型不在 vision_capable_models 里，自动改路由到 vision_model，避免纯文本模型 400 报错。",
+  "requests": {
+    "proxy_url": "",
+    "keepalive_seconds": 15
+  },
+  "_requests_说明": "上游 HTTP 传输层参数（吸收-1/2 §R-B/§R-C）。命名约定说明：既有开关统一在 features.*（stream_gate/affinity/budget），本批新开关按竞品（CLIProxyAPI/CPA）语义落在 requests.* / cooldown.* / routing.*，两组并存、互不覆盖——features.* 管中转自有特性，requests.* 管上游出口与流保活。proxy_url：全局上游代理出口，空=直连；http:// / https:// / socks5:// 均可（socks5 需 socksio，安装器已带 httpx[socks]）；仅在没有 per-provider proxy_url 时兜底。keepalive_seconds：SSE 心跳间隔，默认 15 秒开启（上游思考型模型 prefill 静默期不吐字节，中间层/客户端可能掐连接）；0 = 关闭。心跳为 SSE 注释行 ': keepalive'，不混入数据帧、不重置流内嗅探门死限。",
+  "routing": {
+    "rebind_on": "default"
+  },
+  "_routing_说明": "路由/绑定策略（吸收-1/2 §R-D）。rebind_on：会话粘性的失败重绑档位。\"default\"（缺省）= 现状零改动——成功者覆写绑定、失败一律不动绑定（失败后原绑定保留，下请求粘回原号；401/402/403 经冷却窗口事实性临时不粘、冷却到期又粘回）；\"quota\" = CPA 语义分级——transient 失败（读超时/连接重置/5xx/空流/截断/无内容超时）本次换号但**保持**绑定（保 prompt cache），hard 失败（401/402/403/429/404/inband 4xx/budget_exhausted/OAuth invalid_grant）**持久清除**绑定换号，且只有『命中绑定账号且成功』才覆写绑定（failover 到非绑定账号成功时不覆写）。失败面×归类完整映射见 proxy_core/classify_failure.py 模块文档。面板观测：GET /api/affinity/stats 的 rebind_distribution 计数（默认档恒空——零动作语义）。本子树与既有的 routing.economy（经济路由，见 proxy_core/router.py）并列共存、互不覆盖。",
   "providers": {
     "示例-静态key直转-可删": {
       "base_url": "https://api.任意OpenAI兼容服务.com/v1",
@@ -22,7 +31,18 @@
       "models": [
         "模型名1",
         "模型名2"
-      ]
+      ],
+      "_proxy_url_说明": "该 provider 的专属代理出口（吸收-1/2 §R-B）。三种写法：①不写/空串 = 回退全局 requests.proxy_url；②\"proxy_url\": \"socks5://127.0.0.1:1080\" 或 \"http://user:pass@host:port\" = 走该代理（http/https/socks5，socks5 需 socksio）；③\"proxy_url\": \"direct\" = 显式直连，覆盖全局代理。用途：某个上游按家庭宽带出口 IP 做风控（403/1010）时只给该渠道单独挂代理，其余渠道不动。转发、面板探测、注水探针三处出口一致（不会出现'探测 403 但转发成功'）。所有按 provider 构造的连接一律 trust_env=False——不吃 HTTP(S)_PROXY 环境变量，direct 语义才成立。"
+    },
+    "示例-独立代理出口-可删": {
+      "base_url": "https://api.被按IP风控的服务.com/v1",
+      "api_keys": [
+        "sk-你的Key"
+      ],
+      "models": [
+        "模型名X"
+      ],
+      "proxy_url": "socks5://127.0.0.1:1080"
     },
     "示例-多key轮换与每key停用-可删": {
       "base_url": "https://api.另一个服务.com/v1",

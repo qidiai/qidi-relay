@@ -20,8 +20,10 @@ if [ "$PYVER" -lt 310 ]; then
 fi
 
 # 2. 依赖（用国内镜像加速）
-python3 -m pip install -q flask httpx -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null \
-  || python3 -m pip install -q flask httpx
+#    吸收-1/2 §R-B：httpx[socks] —— providers.<name>.proxy_url 支持
+#    socks5:// 出口，运行时需要 socksio（只装 httpx 会缺）
+python3 -m pip install -q flask 'httpx[socks]' -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null \
+  || python3 -m pip install -q flask 'httpx[socks]'
 
 # 3. 权限收紧：数据文件只允许属主读写（含明文 token）
 chmod 600 accounts.json config.json 2>/dev/null || true

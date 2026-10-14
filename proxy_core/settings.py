@@ -166,6 +166,59 @@ def get_port() -> int:
         return DEFAULT_PORT
 
 
+# ── 上游出口与流保活（吸收-1/2 §R-B / §R-C）─────────────────
+# 命名空间说明（规格 v3 F-10）：既有开关统一在 features.*
+# （stream_gate/affinity/budget），本批新开关按 CPA 语义分组落在
+# requests.* / cooldown.* / routing.*——与竞品（CLIProxyAPI）
+# 文档语义对齐、便于逐项对照；两组命名约定并存，互不覆盖
+# （features.* 管"门/粘性/预算"这类中转自有特性，requests.*
+# 管"上游 HTTP 出口与流保活"这类传输层参数）。
+DEFAULT_KEEPALIVE_S = 15.0   # SSE 心跳（默认 ON；0=关闭）
+
+
+def get_global_proxy_url(cfg: dict | None = None) -> str:
+    """全局上游代理出口（config.json `requests.proxy_url`，缺省空=直连）。
+
+    仅作为**没有** per-provider proxy_url 时的兜底（优先级链：
+    providers.<name>.proxy_url > requests.proxy_url > 无）。
+    返回空串 = 无全局代理（保持 httpx 默认语义中的"直连"）。
+    cfg：已加载的配置（providers._load_providers 复用它，避免重复触盘）；
+    缺省时才自己 load_config()。
+    """
+    r = (cfg if isinstance(cfg, dict) else load_config()).get("requests")
+    if not isinstance(r, dict):
+        return ""
+    v = r.get("proxy_url")
+    return v.strip() if isinstance(v, str) and v.strip() else ""
+
+
+def get_keepalive_seconds() -> float:
+    """SSE 心跳间隔（config.json `requests.keepalive_seconds`）。
+
+    缺省 15s（**默认 ON**——心跳的存在理由就是防上游静默期被
+    中间层/客户端掐线，默认关则功能无意义，规格 §R-C 显式偏离
+    "新默认保守=现状"原则）；0 或负数 = 关闭（回滚开关，关闭
+    分支不发心跳、行为与升级前逐字节一致）。
+    非数字/非有限数 → 回默认值（防御式，与门内容判定同纪律）。
+    """
+    r = load_config().get("requests")
+    if not isinstance(r, dict):
+        return DEFAULT_KEEPALIVE_S
+    v = r.get("keepalive_seconds")
+    if isinstance(v, bool):          # bool 是 int 子类：true/false 无意义，回默认
+        return DEFAULT_KEEPALIVE_S
+    if isinstance(v, (int, float)):
+        if v != v or v in (float("inf"), float("-inf")):
+            return DEFAULT_KEEPALIVE_S
+        return max(0.0, float(v))
+    if isinstance(v, str):
+        try:
+            return max(0.0, float(v.strip()))
+        except (TypeError, ValueError):
+            return DEFAULT_KEEPALIVE_S
+    return DEFAULT_KEEPALIVE_S
+
+
 def get_vision_model() -> str:
     """视觉改路由目标模型，可在 config.json 中用 "vision_model" 覆盖。"""
     m = load_config().get("vision_model", DEFAULT_VISION_MODEL)

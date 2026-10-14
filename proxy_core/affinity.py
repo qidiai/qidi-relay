@@ -38,6 +38,15 @@ cold/resting/spent/disabled/off——v1 auto 档产出
 turn/cache/no-cache/no-data/cold/resting/spent/
 disabled；kept/session/new-turn/off 为策略档保留码
 （off 在直接调用 pick_prefer 且开关关闭时产出）。
+
+rebind 分级（吸收-1/2 §R-D，quota 档 opt-in）：
+- 默认档（routing.rebind_on 缺省）= 现状零改动：成功者覆写绑定、
+  失败不动绑定（失败后绑定原样保留，下请求粘回原号；401/402/403
+  经 mark_cooldown 事实性临时不粘、冷却到期又粘回）。
+- quota 档 = CPA 语义：transient 失败 failover 本次但**保持**绑定；
+  hard 失败**持久清绑定**（clear_binding）；且只有"命中绑定账号且
+  成功"才覆写绑定（record_success 准入），failover 到非绑定账号成功
+  时不覆写。
 """
 
 import hashlib
@@ -48,6 +57,7 @@ import threading
 import time
 from collections import OrderedDict
 
+from proxy_core import classify_failure
 from proxy_core import settings
 from proxy_core.settings import load_config
 from proxy_core.state import am
@@ -60,6 +70,16 @@ _SESSION_TTL_S = 24 * 3600   # 24h 过期
 _CACHE_READ_MIN = 1024       # 跨 turn 粘性最低 cache_read
 _STICK_WINDOW_S = 300        # 跨 turn 粘性时间窗（5min）
 _SWEEP_S = 2.0               # 后台扫尾间隔（≤2s）
+
+# rebind 档位（吸收-1/2 §R-D：routing.rebind_on）
+REBIND_DEFAULT = "default"   # 现状零改动
+REBIND_QUOTA = "quota"       # CPA 语义分级
+
+# rebind 观测计数键（_bump_why 同款扩展，/api/affinity/stats 暴露）
+REBIND_TRANSIENT_KEEP = "transient_keep"     # transient 失败：绑定保持
+REBIND_HARD_CLEAR = "hard_clear"             # hard 失败：绑定已清除
+REBIND_HARD_CLEAR_MISS = "hard_clear_miss"   # hard 失败但本会话无绑定
+REBIND_RECORD_SKIPPED = "record_skipped"     # failover 成功但非绑定账号，不覆写
 
 # why 码（见模块 docstring）
 WHY_KEPT = "kept"
@@ -82,6 +102,8 @@ WHY_OFF = "off"
 _TABLE: "OrderedDict[str, dict]" = OrderedDict()
 # pick_prefer 决策 why 计数（/api/affinity/stats 分布）
 _WHY: dict = {}
+# rebind 决策计数（§R-D：/api/affinity/stats 的 rebind_distribution）
+_REBIND: dict = {}
 _LOCK = threading.Lock()
 _DIRTY = False      # 有未落盘改动
 _LOADED = False     # 启动重读已做（首次访问时）
@@ -298,6 +320,131 @@ def record(session_key: str, uid: str, model: str, usage,
         _evict_locked()
         _DIRTY = True
     _ensure_worker()
+
+
+# ── rebind 分级（吸收-1/2 §R-D）───────────────────────────
+
+def rebind_mode() -> str:
+    """config `routing.rebind_on` 档位（缺省 "default"=现状零改动）。
+
+    与既有 `routing.economy` 子树共存（router.py:109-123）：同一
+    `routing` 命名空间下的并列子项，互不覆盖。非法/未知值一律落回
+    "default"（宁可不改行为，也不静默启用一个没实现的档）。
+    """
+    routing = load_config().get("routing")
+    if not isinstance(routing, dict):
+        return REBIND_DEFAULT
+    v = routing.get("rebind_on")
+    if isinstance(v, str) and v.strip().lower() == REBIND_QUOTA:
+        return REBIND_QUOTA
+    return REBIND_DEFAULT
+
+
+def binding_of(session_key: str):
+    """本会话当前绑定账号 uid（无绑定返回 None；只读，不产生 IO）。"""
+    with _LOCK:
+        _ensure_loaded_locked()
+        entry = _TABLE.get(session_key)
+        return entry["uid"] if entry else None
+
+
+def clear_binding(session_key: str) -> bool:
+    """持久清除会话绑定（§R-D quota 档 hard 失败）。
+
+    **新增 API**（现状 affinity 全文唯一写入口是 record()，没有任何
+    解绑/清除路径）。返回是否确实清掉了一条绑定；同时置脏由后台线程
+    ≤2s 原子落盘（与 record 同一条持久化链路——重启后不复活）。
+    """
+    global _DIRTY
+    if not session_key:
+        return False
+    with _LOCK:
+        _ensure_loaded_locked()
+        if session_key not in _TABLE:
+            return False
+        _TABLE.pop(session_key, None)
+        _DIRTY = True
+    _ensure_worker()
+    return True
+
+
+def record_success(session_key: str, uid: str, model: str, usage,
+                   turn_boundary_changed: bool = True) -> bool:
+    """成功路径的粘性记录入口（§R-D F-1 准入 + record 合一）。
+
+    返回是否真的写入了内存表：
+    - **默认档**：无条件 record（现状语义逐字节不变）；
+    - **quota 档**：仅当「命中绑定账号」或「本会话尚无绑定」才写。
+      failover 到**非绑定**账号成功时**不覆写绑定**（只记
+      rebind:record_skipped + 既有 why 计数）——"绑定保持"语义的关键，
+      否则一次 failover 就把绑定改写走了，prompt cache 收益全丢。
+
+    准入判定与写入在同一把锁内完成，避免查-写竞态。
+    """
+    global _DIRTY
+    quota = (rebind_mode() == REBIND_QUOTA)
+    if turn_boundary_changed is None:
+        turn_boundary_changed = True
+    cache_read, has_cache = _extract_cache_read(usage)
+    with _LOCK:
+        _ensure_loaded_locked()
+        entry = _TABLE.get(session_key)
+        if quota and entry is not None and entry.get("uid") != uid:
+            _bump_rebind(REBIND_RECORD_SKIPPED)
+            return False
+        turn = 1 if entry is None else \
+            entry["turn"] + (1 if turn_boundary_changed else 0)
+        _TABLE[session_key] = {
+            "uid": uid, "model": model, "turn": turn,
+            "at": time.time(), "cache_read": cache_read,
+            "cache_data": has_cache,
+        }
+        _TABLE.move_to_end(session_key)
+        _evict_locked()
+        _DIRTY = True
+    _ensure_worker()
+    return True
+
+
+def on_failure(session_key: str, kind: str) -> str:
+    """失败面处置（§R-D）：按 hard/transient 决定绑定去留。
+
+    返回实际动作（"keep"/"clear"/"miss"/"off"），供调用方留痕/测试断言：
+    - **默认档**：恒 "off"——零动作（现状：失败不动绑定，下请求粘回
+      原号；本函数不产生任何计数，保证"默认档逐字节回归"）；
+    - **quota 档 + TRANSIENT**：绑定保持（failover 本次由换号循环负责），
+      计 rebind:transient_keep → "keep"；
+    - **quota 档 + HARD**：clear_binding 持久清绑定，计 rebind:hard_clear
+      （无绑定可清时计 rebind:hard_clear_miss）→ "clear"/"miss"。
+    """
+    if not session_key:
+        return "off"
+    if rebind_mode() != REBIND_QUOTA:
+        return "off"
+    if kind == classify_failure.HARD:
+        cleared = clear_binding(session_key)
+        with _LOCK:
+            _bump_rebind(REBIND_HARD_CLEAR if cleared
+                         else REBIND_HARD_CLEAR_MISS)
+        return "clear" if cleared else "miss"
+    with _LOCK:
+        _bump_rebind(REBIND_TRANSIENT_KEEP)
+    return "keep"
+
+
+def _bump_rebind(key: str) -> None:
+    """rebind 计数 +1（调用方已持锁，_bump_why 同款）。"""
+    _REBIND[key] = _REBIND.get(key, 0) + 1
+
+
+def rebind_counts() -> dict:
+    """rebind 决策计数快照（§R-D 面板：/api/affinity/stats）。
+
+    独立函数而非并进 snapshot()——snapshot 的二元组返回值是既有
+    调用方（admin 端点 / test_affinity）的契约，改元数会破坏它们。
+    """
+    with _LOCK:
+        return dict(_REBIND)
 
 
 # ── 观测（/api/affinity/stats）──────────────────────────

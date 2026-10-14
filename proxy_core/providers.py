@@ -49,12 +49,14 @@ type 为 "atomcode" 的 provider 不需要 api_key：凭证从官方客户端的
 import logging
 import threading
 
+import httpx
+
 from . import atomcode
 from . import cline
 from . import minicode
 from . import opencode
 from .router import registry
-from .settings import CONFIG_FILE, load_config
+from .settings import CONFIG_FILE, get_global_proxy_url, load_config
 
 log = logging.getLogger("qidi-relay")
 
@@ -198,6 +200,123 @@ def _parse_session_header(name: str, p: dict) -> str:
     return v.strip() if isinstance(v, str) and v.strip() else ""
 
 
+# ── 每 Provider 代理出口（吸收-1/2 §R-B）──────────────────────
+# config: providers.<name>.proxy_url（http:// / https:// / socks5://）
+PROXY_DIRECT = "direct"   # 显式直连（覆盖全局 requests.proxy_url）
+
+
+def parse_proxy_url(p) -> tuple:
+    """解析 providers.<name>.proxy_url → (explicit, url)。
+
+    返回语义（三态，缺一不可——"direct" 必须能与"未配置"区分，
+    否则无法覆盖全局代理）：
+    - (False, None)      未配置/空串 → 回退全局 requests.proxy_url
+    - (True,  None)      字面 "direct"（大小写不敏感）→ 显式直连
+    - (True,  "socks5://…") 使用该代理
+
+    非 dict / 非 str 值一律视为未配置（防御式，与 is_enabled 同纪律：
+    配置手误绝不静默把请求塞进一个非字符串代理）。
+    """
+    if not isinstance(p, dict):
+        return False, None
+    v = p.get("proxy_url")
+    if not isinstance(v, str) or not v.strip():
+        return False, None
+    v = v.strip()
+    if v.lower() == PROXY_DIRECT:
+        return True, None
+    return True, v
+
+
+def effective_proxy_url(p) -> str | None:
+    """优先级链 per-provider > 全局 config > 无（规格 §R-B 设计 6）。
+
+    返回 None = 直连（httpx proxy=None）；返回字符串 = 使用该代理。
+
+    入参两种形态都收（消费方无需区分原始 config 条目 / 已解析 prov
+    dict）：
+    - 原始 config 条目（无 proxy_resolved 标记）：三态解析 + 全局兜底；
+    - 已解析 prov dict（带 proxy_resolved=True，见 _load_providers）：
+      直接取 proxy_url 有效值——**不再回退全局**，否则 "direct"
+      （proxy_url=None）会被再次解析成"未配置"而错误地捡起全局代理。
+    """
+    if isinstance(p, dict) and p.get("proxy_resolved"):
+        return p.get("proxy_url")
+    explicit, url = parse_proxy_url(p)
+    if explicit:
+        return url
+    return get_global_proxy_url() or None
+
+
+# ── 共享 Client 生命周期（吸收-1/2 §R-B 设计 3）────────────────
+# 主池（_stream_open / _proxy_chat 非流式）每次请求新建 Client 并随流关闭；
+# 外部通道（静态 key/atomcode/cline/minicode）改为按 (provider, proxy_url)
+# 复用共享 Client——每请求新建连接池在多 key 轮换 + 长流场景下会反复
+# 握手/丢弃连接池。共享 Client **不随流关闭**（_UpstreamOpen.close 只关
+# resp），失效（config mtime 重建）时由 _load_providers 统一 close 淘汰。
+#
+# trust_env=False（规格 §R-B 设计 6，库内先例 opencode.py:248）：共享 Client
+# 一律不吃 HTTP(S)_PROXY / NO_PROXY 环境变量——只有这样才能让 per-provider
+# 的 "direct" 语义成立（本机实测 Windows 注册表 ProxyEnable=1→7890 时，
+# httpx 默认 trust_env=True 会把所有出口都塞进系统代理，per-provider 代理
+# 配置就被静默架空）。
+_clients: dict = {}          # (name, proxy_url) -> httpx.Client
+_clients_lock = threading.Lock()
+
+
+def get_client(name: str, proxy_url: str | None = None) -> httpx.Client:
+    """取该 (provider, proxy_url) 的共享 Client（无则新建并缓存）。
+
+    同一 provider 的代理配置变更 → 键变化 → 自然拿到新 Client，
+    旧键在下一次 _load_providers 重建时被 close 淘汰（防泄漏）。
+    并发安全：加锁取用/新建（httpx.Client 本身线程安全，多请求共用
+    同一连接池）。
+    """
+    key = (name, proxy_url)
+    with _clients_lock:
+        client = _clients.get(key)
+        if client is None:
+            client = httpx.Client(proxy=proxy_url, trust_env=False)
+            _clients[key] = client
+        return client
+
+
+def _evict_clients_locked(expected: set) -> None:
+    """淘汰不再有效的共享 Client（调用方持有 _clients_lock）。
+
+    expected = {(name, proxy_url)}——本次重载后所有合法的键。不在
+    其中的（proxy_url 变更 / provider 被删除 / 全局代理改动）一律
+    close 并从缓存移除，防止连接池泄漏（规格 §R-B 设计 3 v3 F-11）。
+    """
+    for key in [k for k in _clients if k not in expected]:
+        client = _clients.pop(key, None)
+        if client is None:
+            continue
+        try:
+            client.close()
+        except Exception as e:   # pragma: no cover - 关闭失败不该阻断重载
+            log.warning("旧共享 Client %s 关闭失败: %s", key, e)
+
+
+def close_all_clients() -> None:
+    """关闭并清空全部共享 Client（测试/进程收尾用）。"""
+    with _clients_lock:
+        _evict_clients_locked(set())
+
+
+def make_client(p, timeout=None) -> httpx.Client:
+    """一次性 Client（探针/面板场景）：per-provider 代理 + trust_env=False。
+
+    与 get_client 的区别：**不进共享缓存、用后即关**（探针是低频一次性
+    请求，不值得占一份连接池；连接复用收益在转发路径）。timeout=None
+    时用 httpx 缺省（不显式传——传 None 会被 httpx 解释为"永不超时"）。
+    """
+    kw = {"proxy": effective_proxy_url(p), "trust_env": False}
+    if timeout is not None:
+        kw["timeout"] = timeout
+    return httpx.Client(**kw)
+
+
 def _parse_aliases(name: str, p: dict) -> dict:
     """model_aliases: {"请求别名": "上游真实模型ID"}。
 
@@ -334,6 +453,24 @@ def _load_providers() -> dict:
                     }
                 else:
                     log.warning("provider %s 配置不完整（需 base_url/api_keys/models），已忽略", name)
+        # R-B：per-provider 代理出口解析（三态 → 有效值）。
+        # 全局 requests.proxy_url 复用本次已加载的 cfg（不再触盘）。
+        global_proxy = get_global_proxy_url(cfg)
+        for name, p in (cfg.get("providers") or {}).items():
+            prov = provs.get(name)
+            if prov is None:
+                continue
+            explicit, url = parse_proxy_url(p)
+            prov["proxy_url"] = url if explicit else (global_proxy or None)
+            # 已解析标记：effective_proxy_url 凭它区分"原始 config 条目"
+            # 与"已解析 prov dict"（后者不再回退全局——否则 "direct"
+            # 会被二次解析成"未配置"而错误捡起全局代理）
+            prov["proxy_resolved"] = True
+        # R-B：淘汰被移除键的旧共享 Client（proxy_url 变更 / provider
+        # 被删除 / 全局代理改动）——不 close 就泄漏连接池（v3 F-11）。
+        expected = {(n, pv.get("proxy_url")) for n, pv in provs.items()}
+        with _clients_lock:
+            _evict_clients_locked(expected)
         _cache = (mtime, provs)
         return provs
 

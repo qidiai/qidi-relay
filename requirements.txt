@@ -1,2 +1,5 @@
 flask>=3.0
-httpx>=0.27
+# httpx[socks]：socks5:// 代理出口需要 socksio（吸收-1/2 §R-B）。
+# 只写 httpx 的话，providers.<name>.proxy_url = "socks5://…" 会在
+# 运行时抛 ImportError（存量机器必缺 socksio）。
+httpx[socks]>=0.27

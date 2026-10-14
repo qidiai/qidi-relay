@@ -96,10 +96,17 @@ def api_gate():
 def api_affinity_stats():
     """会话粘性观测（方案 §4）：stuck_sessions=当前粘连
     会话数（内存表锁内快照，24h 过期条目已清出）；
-    why_distribution=粘性决策 why 计数分布。"""
+    why_distribution=粘性决策 why 计数分布。
+
+    §R-D 补 rebind_distribution：rebind 分级决策计数
+    （quota 档下的 transient_keep / hard_clear / hard_clear_miss /
+    record_skipped；默认档恒为空——默认档零动作、不计数的语义
+    本身就是"现状零改动"的证据）。
+    """
     stuck, dist = affinity.snapshot()
     return jsonify({"stuck_sessions": stuck,
-                    "why_distribution": dist})
+                    "why_distribution": dist,
+                    "rebind_distribution": affinity.rebind_counts()})
 
 
 # ─── 账号管理 ────────────────────────────────────────────────────────────────
@@ -1394,7 +1401,9 @@ def api_provider_probe(name):
         return jsonify({"error": f"provider「{name}」配置不完整（缺 base_url/api_keys）"}), 400
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
     try:
-        with httpx.Client(timeout=10) as client:
+        # R-B：探针同样走 per-provider 代理出口（面板探测 403 而转发
+        # 成功的自相矛盾 UX 必须避免）；trust_env=False + 一次性 client。
+        with providers.make_client(p, 10) as client:
             r = client.get(base_url + "/models", headers=headers)
             if r.status_code != 200:
                 return jsonify({"error": f"GET /models 返回 {r.status_code}（{base_url} 无可用模型列表端点）"}), 502
@@ -1410,7 +1419,8 @@ def api_provider_probe(name):
     probe_set = candidates[:_PROBE_MAX]
     ok, fail = [], []
     if probe_set:
-        with httpx.Client(timeout=_PROBE_TIMEOUT_S) as client:
+        # R-B：探测 client 同样走 per-provider 代理出口
+        with providers.make_client(p, _PROBE_TIMEOUT_S) as client:
             with ThreadPoolExecutor(max_workers=_PROBE_CONCURRENCY) as pool:
                 futs = [pool.submit(_probe_one, client, base_url, key, m)
                         for m in probe_set]
@@ -2058,7 +2068,10 @@ def api_providers_info():
             ]
         headers = {"Authorization": f"Bearer {prov['api_key']}", "Accept": "application/json"}
         try:
-            with httpx.Client() as client:
+            # R-B：面板探针走 per-provider 代理出口（与转发路径一致性）。
+            # prov 是已解析 dict（带 proxy_resolved），effective_proxy_url
+            # 直接取有效值。
+            with providers.make_client(prov) as client:
                 r = client.get(prov["base_url"] + "/dashboard/billing/subscription",
                                headers=headers, timeout=8)
                 item["subscription_status"] = r.status_code
