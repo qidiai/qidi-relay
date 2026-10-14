@@ -21,6 +21,12 @@ LOG_FILE = BASE_DIR / "proxy.log"
 # seedguard 式 BASE_DIR 兜底直写仓库数据文件）。
 CONVERSATIONS_FILE = BASE_DIR / "conversations.json"
 
+# 冷却状态持久化（吸收-1 / 规格 §R-A）：静态 key provider 级
+# 冷却（_prov_quota_cooldown）与 cline/minicode 通道级冷却的
+# 落盘文件。路径常量可注入（测试重定向到 TMP——与
+# CONVERSATIONS_FILE 同纪律，§7.7）。
+COOLDOWNS_FILE = BASE_DIR / "cooldowns.json"
+
 # 语料采集（阶段 E / 方案 §7）：本地语料落盘目录
 # （local_YYYYMM.jsonl 与云端 corpus_pull 拉取的
 # corpus_YYYYMM.jsonl 按文件名隔离——§7.2 分名设计

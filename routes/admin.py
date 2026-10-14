@@ -1680,7 +1680,8 @@ def api_add():
     token = data.get("token", "")
     if not user_id or not token:
         return jsonify({"error": "user_id 和 token 不能为空"}), 400
-    if not am.add_account(user_id, token, data.get("username", ""), data.get("org_id", "")):
+    if not am.add_account(user_id, token, data.get("username", ""), data.get("org_id", ""),
+                          data.get("weight", 1)):
         return jsonify({"error": "账号已存在"}), 400
     return jsonify({"ok": True})
 
@@ -2050,7 +2051,9 @@ def api_providers_info():
             item["key_disabled_count"] = len(prov["keys"]) - len(enabled_keys)
             item["key_entries"] = [
                 {"label": k["label"], "preview": _mask_key(k["key"]),
-                 "disabled": bool(k.get("disabled"))}
+                 "disabled": bool(k.get("disabled")),
+                 # R-E 权重（面板徽章：有 weight 且 ≠1 时显示）
+                 "weight": k.get("weight", 1)}
                 for k in prov["keys"]
             ]
         headers = {"Authorization": f"Bearer {prov['api_key']}", "Accept": "application/json"}

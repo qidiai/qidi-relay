@@ -37,12 +37,9 @@ hunyuanocr/models/
 # Publish hardening (2026-10-09, pre-push audit)
 wb/accounts/
 conversations.json
+cooldowns.json
 .pytest_cache/
 
 # multi-suffix logs (proxy.log.3 etc.)
 *.log.*
 _tmp_*.txt
-
-# minicode 多账号登记（本机路径，不入库；模板见 accounts.example.json）
-minicode/accounts.json
-minicode/accounts/

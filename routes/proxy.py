@@ -27,6 +27,7 @@ from proxy_core import opencode
 from proxy_core import anthropic
 from proxy_core import affinity
 from proxy_core import budget
+from proxy_core import cooldown_store
 from proxy_core import corpus
 from proxy_core.accounts import AUTH_COOLDOWN_S, QUOTA_COOLDOWN_S
 from proxy_core.atomcode import channels_for, pick_channel
@@ -2647,6 +2648,11 @@ def _forward_external(data: dict, model: str, prov: dict):
     pname = prov["name"]
     # 0929：全 key 配额耗尽冷却中 → 快速失败，不再逐 key 白打上游
     _cd_until = _prov_quota_cooldown.get(pname)
+    if _cd_until is None:
+        # R-A：重启后从持久化 store 预热 provider 冷却（窗口内照样快速失败）
+        _cd_until = cooldown_store.get_provider(pname)
+        if _cd_until:
+            _prov_quota_cooldown[pname] = _cd_until
     if _cd_until and time.time() < _cd_until:
         left = max(1, int(_cd_until - time.time()))
         log.warning("[%s] 全 key 配额冷却中，剩 %d 秒（快速失败不打上游）", pname, left)
@@ -2834,6 +2840,7 @@ def _forward_external(data: dict, model: str, prov: dict):
                 # 0929：全部 key 均配额耗尽 → provider 级冷却，后续请求快速失败
                 if status == 429 and ("quota" in snippet.lower() or not snippet):
                     _prov_quota_cooldown[pname] = time.time() + PROVIDER_QUOTA_COOLDOWN_S
+                    cooldown_store.set_provider(pname, _prov_quota_cooldown[pname])  # R-A 持久化
                     log.warning("[%s] 全部 key 配额耗尽(429 quota)，provider 冷却 %.0f 分钟",
                                  pname, PROVIDER_QUOTA_COOLDOWN_S / 60)
                 return _openai_error(
@@ -2841,6 +2848,7 @@ def _forward_external(data: dict, model: str, prov: dict):
                     "proxy_upstream_error", f"upstream_{status}", status)
             # 负载键加前缀隔离命名空间：与 pick_key/pick_channel 的 load_of 查询键一致
             _prov_quota_cooldown.pop(pname, None)   # 0929：任何 key 成功即解除冷却
+            cooldown_store.clear_provider(pname)    # R-A：解除落盘（重启不复活）
             load_key = f"key:{pname}|{key_label}" if not is_ac else f"ac:{pname}|{key_label}"
             if gate_opened is None:
                 # 门关（或本轮未走到门）：与升级前逐字节一致
@@ -2900,11 +2908,13 @@ def _forward_external(data: dict, model: str, prov: dict):
             # 0929：全部 key 均配额耗尽 → provider 级冷却，后续请求快速失败
             if r.status_code == 429 and ("quota" in r.text.lower() or not r.text):
                 _prov_quota_cooldown[pname] = time.time() + PROVIDER_QUOTA_COOLDOWN_S
+                cooldown_store.set_provider(pname, _prov_quota_cooldown[pname])  # R-A 持久化
                 log.warning("[%s] 全部 key 配额耗尽(429 quota)，provider 冷却 %.0f 分钟",
                              pname, PROVIDER_QUOTA_COOLDOWN_S / 60)
             return Response(r.content, status=r.status_code,
                             content_type=r.headers.get("content-type", "application/json"))
         _prov_quota_cooldown.pop(pname, None)   # 0929：任何 key 成功即解除冷却
+        cooldown_store.clear_provider(pname)    # R-A：解除落盘（重启不复活）
         resp_json = r.json()
         usage = resp_json.get("usage")
         if usage:

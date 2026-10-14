@@ -60,6 +60,9 @@ class AccountManager:
                     "cooldown_reason": acc.get("cooldown_reason", ""),
                     "quota_team": acc.get("quota_team", ""),
                     "group": acc.get("group", ""),
+                    # R-E 凭证权重：白名单透传（防 _save 全量回写抹除）。
+                    # 本批仅透传/面板展示，不参与 get_next 选号（延后独立项）。
+                    "weight": acc.get("weight", 1),
                 })
             groups = sorted({a.get("group") or "默认" for a in self.accounts})
             log.info("已加载 %d 个账号（分组: %s）", len(self.accounts), ", ".join(groups))
@@ -329,6 +332,7 @@ class AccountManager:
                     if a.get("budget_exceeded") else 0,
                 "cooldown_reason": a.get("cooldown_reason", ""),
                 "group": a.get("group", ""),
+                "weight": a.get("weight", 1),   # R-E 权重（仅面板展示）
             })
         return result
 
@@ -348,10 +352,19 @@ class AccountManager:
                 a["has_glm53"] = has_glm53
                 self._save()
 
-    def add_account(self, user_id: str, token: str, username: str = "", org_id: str = ""):
-        """新增账号；已存在返回 False。"""
+    def add_account(self, user_id: str, token: str, username: str = "", org_id: str = "",
+                    weight: int = 1):
+        """新增账号；已存在返回 False。
+
+        weight（R-E 凭证权重）：入参透传 + 防御式解析（非法→1）。
+        本批仅透传/面板展示，不参与 get_next 选号（延后独立项）。
+        """
         if any(a["user_id"] == user_id for a in self.accounts):
             return False
+        try:
+            weight = int(weight)
+        except (TypeError, ValueError):
+            weight = 1
         self.accounts.append({
             "user_id": user_id,
             "username": username,
@@ -363,6 +376,7 @@ class AccountManager:
             "has_glm53": False,
             "budget_exceeded": False,
             "group": "",
+            "weight": weight,
         })
         self._save()
         return True

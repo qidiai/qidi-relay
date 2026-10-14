@@ -270,6 +270,9 @@ async function loadAccounts() {
         ? `<span class="badge quota" title="冷却到期自动恢复，无需手动启用">${esc(a.cooldown_reason || "配额用尽")} · ${cdMin}分</span>`
         : a.enabled ? '<span class="badge on">运行中</span>' : '<span class="badge off">已禁用</span>';
       const glmBadge = a.has_glm53 ? '<span class="badge glm">GLM-5.3</span>' : "";
+      // R-E: 凭证权重徽章（有 weight 且 ≠1 时显示；主池选号权重生效延后，本批仅展示）
+      const weightBadge = (a.weight != null && Number(a.weight) !== 1)
+        ? `<span class="badge ext" title="凭证权重（负载除数，展示用；主池选号暂未启用权重）">权重 ${esc(a.weight)}</span>` : "";
       // 0831：订阅/免费组徽章 + 邮箱（来自 JWT，本地解析），一眼区分哪个号是订阅
       // 0901 三档："" = Lite 订阅 / free = 免费号 / pro = Pro 订阅
       const groupBadge = a.group === "free"
@@ -296,7 +299,7 @@ async function loadAccounts() {
           <span class="acc-name">${esc(a.username || "未命名")}</span>
           <span class="acc-id">#${esc(a.user_id)}</span>
         </div>
-        <div class="acc-badges">${loginBadge}${stateBadge}${groupBadge}${glmBadge}${loadBadge}</div>
+        <div class="acc-badges">${loginBadge}${stateBadge}${groupBadge}${glmBadge}${weightBadge}${loadBadge}</div>
         ${emailLine}
         <div class="acc-meta"><span>调用 <b>${fmtFull(a.use_count)}</b> 次</span><span>KEY 剩余 <b>${esc(a.token_remaining_hours)}h</b></span></div>
         ${upLine}
@@ -728,10 +731,13 @@ function renderProviderCard(p) {
       // F14: 停用的 key 保留在池中但不参与路由轮换（可再启用）
       const off = !!k.disabled;
       const badge = off ? '<span class="badge off">已停用</span>' : "";
+      // R-E: 权重徽章（有 weight 且 ≠1 时显示，与 disabled 徽章区分）
+      const wBadge = (k.weight != null && Number(k.weight) !== 1)
+        ? `<span class="badge ext" title="凭证权重（负载除数）：越高越优先，0=软停用">权重 ${esc(k.weight)}</span>` : "";
       const tbtn = off
         ? `<button class="btn tiny primary" onclick="toggleProviderKey('${esc(p.name)}','${esc(k.label)}',false)">启用</button>`
         : `<button class="btn tiny ghost" onclick="toggleProviderKey('${esc(p.name)}','${esc(k.label)}',true)">停用</button>`;
-      return `<div class="ac-acct${off ? " dim" : ""}"><span title="脱敏预览 ${esc(k.preview)}">${badge}${esc(k.label)} · ${esc(k.preview)}</span>` +
+      return `<div class="ac-acct${off ? " dim" : ""}"><span title="脱敏预览 ${esc(k.preview)}">${badge}${wBadge}${esc(k.label)} · ${esc(k.preview)}</span>` +
         tbtn +
         `<button class="btn tiny danger" onclick="removeProviderKey('${esc(p.name)}','${esc(k.label)}')">移除</button></div>`;
     }).join("");

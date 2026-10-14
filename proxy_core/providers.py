@@ -62,9 +62,63 @@ _lock = threading.Lock()
 _cache = None  # (mtime, {name: provider dict})
 _key_rr = {}   # provider name -> 轮转游标（同负载时轮转选 key）
 
+# R-E 凭证权重：越界/非法值钳制时的"逐 key 一次性"告警去重集
+# （get_api_keys/_load_providers 每请求/每次重载都解析，防刷屏）。
+_WEIGHT_WARNED: set = set()
+
+# 权重上限（软停用=0；>1000 视为配置笔误，钳到 1000）
+_WEIGHT_MAX = 1000
+
+
+def _coerce_weight(name: str, key: str, raw) -> int:
+    """把配置里的 weight 解析为受约束的 int（吸收-2 / 规格 §R-E）。
+
+    语义：weight 缺省 1；0 = 软停用（不参与选号，与 F14 disabled
+    并存时 disabled 优先）；负数→0；>1000→1000；字符串 "2"→2。
+    钳制/非法时逐 key 发一次性 warning（R-004 可见）。
+    """
+    if raw is None:
+        return 1
+    val = raw
+    note = None
+    if isinstance(val, bool):            # bool 是 int 子类，先摘出来真值化
+        val = int(val)
+    elif isinstance(val, str):
+        try:
+            val = int(val.strip())
+        except (TypeError, ValueError):
+            val = None
+            note = "非整数"
+    elif isinstance(val, float):
+        if val != val or val in (float("inf"), float("-inf")):
+            val = None
+            note = "非有限数"
+        else:
+            val = int(val)
+    if not isinstance(val, int):
+        _warn_weight_once(name, key, raw, note or "非法值", 1)
+        return 1
+    if val < 0:
+        _warn_weight_once(name, key, raw, "负数（钳为 0=软停用）", 0)
+        return 0
+    if val > _WEIGHT_MAX:
+        _warn_weight_once(name, key, raw, f"超上限（钳为 {_WEIGHT_MAX}）", _WEIGHT_MAX)
+        return _WEIGHT_MAX
+    return val
+
+
+def _warn_weight_once(name: str, key: str, raw, why: str, applied: int) -> None:
+    """逐 key 一次性告警（不打印完整 key）。"""
+    sig = (name, key)
+    if sig in _WEIGHT_WARNED:
+        return
+    _WEIGHT_WARNED.add(sig)
+    log.warning("provider %s 的 key %s… 权重配置 weight=%r %s，按 %d 处理",
+                name, key[:8], raw, why, applied)
+
 
 def _parse_keys(name: str, p: dict) -> list:
-    """把 api_key / api_keys 归一化为 [{"key", "label"[, "disabled"]}] 列表。
+    """把 api_key / api_keys 归一化为 [{"key", "label"[, "disabled"][, "weight"]}] 列表。
 
     规则：
     - 数组元素可为字符串或 {"key": ..., "label": ...}；label 缺省 "<provider>·<序号>"
@@ -73,27 +127,33 @@ def _parse_keys(name: str, p: dict) -> list:
     - disabled（F14 per-key 启停）：dict 条目透传其 disabled 真值——仅当
       停用时输出 "disabled": True（启用态省略该键，保持 config 干净）；
       str 条目恒为启用态。停用的 key 保留在池内但不参与 pick_key 选号。
+    - weight（R-E 凭证权重）：dict 条目透传，钳制后**仅当 ≠1 时**输出
+      "weight"（缺省 1，保持 config 干净）；缺省=1 时 pick_key 选择与
+      升级前逐位一致。0 = 软停用（不参与选号）。
     """
-    raw_entries = []  # (key, label, disabled)
+    raw_entries = []  # (key, label, disabled, weight_raw)
     arr = p.get("api_keys")
     if isinstance(arr, list):
         for k in arr:
             if isinstance(k, str) and k.strip():
-                raw_entries.append((k.strip(), "", False))
+                raw_entries.append((k.strip(), "", False, None))
             elif isinstance(k, dict) and isinstance(k.get("key"), str) and k.get("key").strip():
                 raw_entries.append((k["key"].strip(), str(k.get("label") or "").strip(),
-                                    bool(k.get("disabled"))))
+                                    bool(k.get("disabled")), k.get("weight")))
     single = p.get("api_key")
     if isinstance(single, str) and single.strip():
-        raw_entries.append((single.strip(), "", False))
+        raw_entries.append((single.strip(), "", False, None))
 
     # 保持输入顺序；无 label 的重复 key 去重，带 label 的重复保留
     out = []
     present = set()
-    for key, label, disabled in raw_entries:
+    for key, label, disabled, weight_raw in raw_entries:
         entry = {"key": key, "label": label}
         if disabled:
             entry["disabled"] = True
+        weight = _coerce_weight(name, key, weight_raw)
+        if weight != 1:
+            entry["weight"] = weight
         if label:
             out.append(entry)
             present.add(key)
@@ -283,12 +343,21 @@ def pick_key(prov: dict, exclude: set = None) -> dict | None:
 
     返回 {"key": ..., "label": ...}；无可用 key 返回 None。
     exclude：重试时排除已失败的 key（按 key 本体匹配）。
+
+    权重（R-E）：effective_load = load / weight，取最低者。weight 缺省
+    1 时数学上严格等于现状（load/1 == load）；weight<=0 = 软停用，
+    过滤发生在 len==1 早退**之前**（单 key 且 weight=0 → None，与
+    F14 disabled 同语义）。同 effective_load 时保留 _key_rr 轮转起点
+    保公平。与"重复 key=更高选中权重"机制（见模块 docstring）并存。
     """
     keys = prov.get("keys") or []
     # F14: 停用（disabled）的 key 保留在池内但不参与选号——额度耗尽的 key
     # 先停用，待额度重置再启用。与 exclude 叠加过滤后为空 → None
     # （调用方 _forward_external 的 None 处理链已存在：无可用 key 直接判负）。
     keys = [k for k in keys if not k.get("disabled")]
+    # R-E: weight<=0 = 软停用，不参与选号。过滤在 len==1 早退之前——
+    # 单 key 且 weight=0 时返回 None（"软停用"优先于"单 key 直选"）。
+    keys = [k for k in keys if (k.get("weight", 1) or 0) > 0]
     if exclude:
         keys = [k for k in keys if k["key"] not in exclude]
     if not keys:
@@ -297,11 +366,13 @@ def pick_key(prov: dict, exclude: set = None) -> dict | None:
         return keys[0]
     # 负载键加 provider 前缀隔离命名空间（防跨 provider 同名 label 污染负载计数）
     loads = {k["label"]: registry.load_of(f"key:{prov['name']}|{k['label']}") for k in keys}
+    # R-E: 有效负载 = 负载 / 权重（weight 缺省 1 时与现状逐位一致）
+    eff = {k["label"]: loads[k["label"]] / (k.get("weight", 1) or 1) for k in keys}
     start = _key_rr.get(prov["name"], 0) % len(keys)
     best = None
     for i in range(len(keys)):
         k = keys[(start + i) % len(keys)]
-        if best is None or loads[k["label"]] < loads[best["label"]]:
+        if best is None or eff[k["label"]] < eff[best["label"]]:
             best = k
     _key_rr[prov["name"]] = (start + 1) % len(keys)
     return best

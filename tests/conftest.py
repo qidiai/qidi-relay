@@ -24,3 +24,4 @@ import proxy_core.settings as S
 
 _S_TMP = pathlib.Path(tempfile.mkdtemp(prefix="qidi-affinity-conftest-"))
 S.CONVERSATIONS_FILE = _S_TMP / "conversations.json"
+S.COOLDOWNS_FILE = _S_TMP / "cooldowns.json"   # 冷却状态持久化（吸收-1 §R-A）

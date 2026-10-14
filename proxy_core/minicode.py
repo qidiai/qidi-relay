@@ -66,6 +66,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .settings import BASE_DIR
+from . import cooldown_store
 
 log = logging.getLogger("qidi-relay")
 
@@ -309,6 +310,8 @@ class MiniCodeChannel:
     def set_cooldown(self, seconds: float, note: str = ""):
         self.cooldown_until = time.time() + max(1, seconds)
         self.cooldown_note = str(note or "")[:120]
+        # R-A：通道级冷却持久化（重载/重启后按 prov|label 回灌）
+        cooldown_store.set_channel(self.name, self.label, self.cooldown_until)
 
     def invalidate(self):
         """401 等凭证失效：丢弃内存缓存强制重读（官方客户端/刷新后可再试）。"""
@@ -422,6 +425,22 @@ def reload_channels_from_config(cfg: dict) -> None:
             new[name] = chs
     _channels.clear()
     _channels.update(new)
+    _restore_cooldowns(new)
+
+
+def _restore_cooldowns(new: dict) -> None:
+    """R-A：通道实例重建后按 prov|label 回灌持久化冷却（晚于实例
+    构造、早于首个请求）。label 不稳定（重命名/删除）的键过期自然
+    失效，不跨实例错挂；恢复失败仅 warning 不阻断重载。"""
+    for name, chs in new.items():
+        for ch in chs:
+            try:
+                until = cooldown_store.get_channel(name, ch.label)
+            except Exception as e:
+                log.warning("[minicode] 冷却恢复失败 %s|%s: %s", name, ch.label, e)
+                continue
+            if until:
+                ch.cooldown_until = until
 
 
 def channels_for(name: str) -> list:
