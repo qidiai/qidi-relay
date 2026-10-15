@@ -46,6 +46,53 @@ async function api(url, opts = {}) {
   return r;
 }
 
+// ─── 视图切换（总览 / 渠道 / 运维 / 设置）────────────────────
+// 单页四视图：只切换 .view 的 display；全部面板节点常驻 DOM，后台照常刷新。
+let currentView = "overview";
+
+const VIEW_NAMES = ["overview", "channels", "ops", "settings"];
+
+// 各视图归属的面板 id（文档 / 断言用；刷新走下面的分组函数）
+const VIEW_PANELS = {
+  overview: ["panel-connect", "panel-playground", "panel-trend", "panel-dist"],
+  channels: ["panel-accounts", "panel-providers", "panel-quality", "panel-keys"],
+  ops: ["panel-activity", "panel-inflight", "panel-logs", "panel-gate", "panel-affinity", "panel-corpus"],
+  settings: ["panel-settings"],
+};
+
+// 视图级刷新分组（不改任何轮询间隔；仅供启动与切 tab 强刷一次）
+function refreshOverview() { loadTokenStats(); loadHistory(); }
+function refreshChannels() { loadAccounts(); loadUpstream(); loadProvidersInfo(); loadKeysInfo(); loadQuality(); }
+function refreshOps(force) { loadActivity(); loadLogs(!!force); loadGate(); loadAffinity(); loadCorpus(); loadInflight(); }
+function refreshSettings() { loadAuthState(); }
+
+const VIEW_REFRESH = {
+  overview: refreshOverview,
+  channels: refreshChannels,
+  ops: refreshOps,
+  settings: refreshSettings,
+};
+
+// 切换显示 + 记忆（不触发刷新）
+function applyView(name) {
+  if (!VIEW_NAMES.includes(name)) name = "overview"; // 非法值回退总览
+  currentView = name;
+  VIEW_NAMES.forEach(v => {
+    const box = $("view-" + v);
+    if (box) box.classList.toggle("active", v === name);
+  });
+  document.querySelectorAll("#view-tabs .vtab").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === name));
+  try { localStorage.setItem("qidi-view", name); } catch (e) { /* 隐私模式忽略 */ }
+}
+
+// 用户切换视图：显示 + 对该视图组强刷一次
+function setView(name) {
+  applyView(name);
+  const fn = VIEW_REFRESH[currentView];
+  if (fn) fn(true);
+}
+
 // 数字滚动动画
 const kpiPrev = {};
 function animateNum(el, target, formatter = fmtFull) {
@@ -650,7 +697,8 @@ async function loadUpstream() {
   } catch (e) { /* 忽略瞬时错误 */ }
 }
 
-// 面板 DOM 由 JS 动态创建（静态文件免重启生效；老进程缓存的 index.html 不含此节点）
+// 外部账号面板已静态写入 index.html（渠道视图）：静态节点存在时直接返回；
+// 仅当老进程缓存的旧 index.html 不含该节点时才回退动态创建（静态文件免重启生效）。
 function ensureProvidersPanel() {
   let sec = $("panel-providers");
   if (sec) return sec;
@@ -1090,12 +1138,13 @@ async function loadProvidersInfo() {
   if (!isAdmin || !providersSupported) return;
   try {
     const r = await api("/api/providers/info");
-    if (r.status === 404) { providersSupported = false; return; } // 旧后端无此接口
+    if (r.status === 404) { providersSupported = false; const s = $("panel-providers"); if (s) s.style.display = "none"; return; } // 旧后端无此接口
     const d = await r.json();
     const provs = d.providers || [];
-    if (!provs.length) return; // 未配置外部 provider，不显示面板
     const sec = ensureProvidersPanel();
     if (!sec) return;
+    if (!provs.length) { sec.style.display = "none"; return; } // 未配置外部 provider：隐藏面板（保留原行为）
+    sec.style.display = ""; // 面板已静态化，需显式恢复显示
     $("provider-count-tag").textContent = `${provs.length} LINKED`;
     $("provider-grid").innerHTML = provs.map(renderProviderCard).join("");
   } catch (e) { /* 忽略瞬时错误 */ }
@@ -1825,22 +1874,12 @@ document.querySelectorAll("[data-logfilter]").forEach(b => {
 // ─── 启动与轮询 ──────────────────────────────────────────────
 
 function loadAll() {
-  loadAccounts();
-  loadUpstream();
-  loadProvidersInfo();
-  loadKeysInfo();
-  loadInflight();
-  loadWater();
-  loadTokenStats();
-  loadHistory();
-  loadActivity();
-  loadLogs(true);
-  loadAuthState();
-  loadModels();
-  loadGate();
-  loadAffinity();
-  loadQuality();
-  loadCorpus();
+  loadModels();     // 全局：测试台模型下拉
+  loadWater();      // 全局：注水检测
+  loadAuthState();  // 设置视图 + 顶栏鉴权状态
+  refreshOverview();
+  refreshChannels();
+  refreshOps(true);
 }
 
 loadHealth();
@@ -1857,3 +1896,17 @@ setInterval(() => { if (isAdmin) { loadGate(); } }, 3000);
 setInterval(() => { if (isAdmin) { loadInflight(); } }, 3000);
 setInterval(() => { if (isAdmin) { loadWater(); } }, 15000);
 addEventListener("resize", () => { loadHistory(); renderDist(); });
+
+// 视图导航：事件委托绑定 + 恢复上次视图（非法值回退总览；不触发强刷，启动数据由 loadAll 覆盖）
+(function initViewTabs() {
+  const tabs = $("view-tabs");
+  if (tabs) {
+    tabs.addEventListener("click", (e) => {
+      const btn = e.target.closest(".vtab");
+      if (btn && btn.dataset.view) setView(btn.dataset.view);
+    });
+  }
+  let saved = "overview";
+  try { saved = localStorage.getItem("qidi-view") || "overview"; } catch (e) { /* 忽略 */ }
+  applyView(saved);
+})();

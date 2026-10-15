@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QiDi Relay · 局域网中转控制台</title>
-<link rel="stylesheet" href="/static/app.css?v=46">
+<link rel="stylesheet" href="/static/app.css?v=55">
 </head>
 <body>
 <canvas id="bg-canvas"></canvas>
@@ -34,6 +34,14 @@
   </div>
 </header>
 
+<!-- ═══ 视图导航（总览 / 渠道 / 运维 / 设置）═══ -->
+<nav class="view-tabs" id="view-tabs">
+  <button class="vtab active" data-view="overview">总览</button>
+  <button class="vtab" data-view="channels">渠道</button>
+  <button class="vtab" data-view="ops">运维</button>
+  <button class="vtab" data-view="settings">设置</button>
+</nav>
+
 <!-- ═══ KPI 指标带 ═══ -->
 <section class="kpi-strip">
   <div class="kpi"><div class="kpi-label">累计请求</div><div class="kpi-val" id="kpi-requests">0</div><div class="kpi-spark" id="kpi-req-sub">REQ</div></div>
@@ -44,6 +52,9 @@
 
 <!-- ═══ 主网格 ═══ -->
 <main class="grid">
+
+<!-- ═══ 视图：总览 ═══ -->
+<div class="view active" id="view-overview">
 
   <!-- 接入信息 -->
   <section class="panel" id="panel-connect">
@@ -71,6 +82,26 @@
     </div>
   </section>
 
+  <!-- API 测试台 -->
+  <section class="panel" id="panel-playground">
+    <div class="panel-head">
+      <h2>API 测试台 <span class="tag">PLAYGROUND</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="pg-row">
+        <select id="pg-model" class="input"><option value="">加载模型中…</option></select>
+        <input id="pg-apikey" class="input" type="password" placeholder="API Key（服务端启用鉴权时填写）" style="max-width:260px">
+        <label class="pg-stream"><input type="checkbox" id="pg-stream" checked> 流式</label>
+      </div>
+      <textarea id="pg-input" class="input" rows="3" placeholder="输入测试消息，回车发送（Shift+Enter 换行）">你好，用一句话介绍你自己。</textarea>
+      <div class="pg-row">
+        <button class="btn primary" id="pg-send" onclick="pgSend()">发 送</button>
+        <span class="pg-meta" id="pg-meta"></span>
+      </div>
+      <pre class="pg-output" id="pg-output">// 响应输出区 — 验证代理链路是否畅通</pre>
+    </div>
+  </section>
+
   <!-- 用量趋势 -->
   <section class="panel wide" id="panel-trend">
     <div class="panel-head">
@@ -91,6 +122,26 @@
     </div>
   </section>
 
+  <!-- 用量分布 -->
+  <section class="panel" id="panel-dist">
+    <div class="panel-head">
+      <h2>用量分布 <span class="tag">SHARE</span></h2>
+      <div class="head-actions">
+        <button class="stab active" data-dist="model">按模型</button>
+        <button class="stab" data-dist="account">按账号</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <canvas id="dist-canvas" height="200"></canvas>
+      <div class="dist-list" id="dist-list"></div>
+    </div>
+  </section>
+
+</div><!-- /view-overview -->
+
+<!-- ═══ 视图：渠道 ═══ -->
+<div class="view" id="view-channels">
+
   <!-- 账号矩阵 -->
   <section class="panel wide" id="panel-accounts">
     <div class="panel-head">
@@ -106,21 +157,18 @@
     </div>
   </section>
 
-  <!-- 用量分布 -->
-  <section class="panel" id="panel-dist">
+  <!-- 外部账号（原 JS 动态注入 F 面板，现静态化直出；ensureProvidersPanel 静态存在时直接返回） -->
+  <section class="panel wide" id="panel-providers">
     <div class="panel-head">
-      <h2>用量分布 <span class="tag">SHARE</span></h2>
+      <h2>外部账号 <span class="tag" id="provider-count-tag">EXTERNAL</span></h2>
       <div class="head-actions">
-        <button class="stab active" data-dist="model">按模型</button>
-        <button class="stab" data-dist="account">按账号</button>
+        <button class="btn tiny primary" onclick="openProviderAddModal()" title="添加新外部渠道（config.json providers 节块首插入，文本级保留式写入）">+ 添加渠道</button>
+        <button class="btn tiny" onclick="loadProvidersInfo()" title="重新查询外部账号信息（服务端缓存 120s）">刷新</button>
       </div>
     </div>
     <div class="panel-body">
-      <canvas id="dist-canvas" height="200"></canvas>
-      <div class="dist-list" id="dist-list"></div>
-      <div class="danger-zone">
-        <button class="btn tiny danger" onclick="resetTokenStats()">清空全部统计</button>
-      </div>
+      <div class="account-grid" id="provider-grid"></div>
+      <p class="hint">外部 Provider 在 config.json 的 providers 节配置（agnes 等支持 api_keys 多 key 轮换）；订阅/用量取自其 OpenAI 计费接口，不支持的端点会如实标注。静态 Key 也可在下方卡片里直接增删（自动备份 config.json，热生效，响应只回脱敏预览）。</p>
     </div>
   </section>
 
@@ -151,54 +199,10 @@
     </div>
   </section>
 
-  <!-- 语料采集 -->
-  <section class="panel" id="panel-corpus">
-    <div class="panel-head">
-      <h2>语料采集 <span class="tag" id="corpus-count-tag">CORPUS</span></h2>
-    </div>
-    <div class="panel-body">
-      <div class="acc-empty" id="corpus-off">语料采集未启用（config corpus.enabled）</div>
-      <div id="corpus-on" style="display:none">
-        <div class="acc-meta"><span>今日 <b id="corpus-today-count">0</b> 条 · <b id="corpus-today-tokens">0</b> tok</span><span>本月 <b id="corpus-month-count">0</b> 条 · <b id="corpus-month-tokens">0</b> tok</span></div>
-        <div class="acc-meta"><span>模型 top3 <b id="corpus-models">—</b></span></div>
-        <div class="acc-meta"><span>角色 top3 <b id="corpus-roles">—</b></span></div>
-        <div class="acc-meta"><span>注水嫌疑 <b id="corpus-water">0</b></span><span>脱敏命中 <b id="corpus-redact">0</b></span></div>
-        <div class="acc-meta"><span>丢弃 <b id="corpus-discard">0</b></span><span>队列积压 <b id="corpus-backlog">0</b></span></div>
-      </div>
-      <p class="hint">语料落盘 worker 实时计数；按模型 / 角色各取 top3。</p>
-    </div>
-  </section>
+</div><!-- /view-channels -->
 
-  <!-- 会话粘性 -->
-  <section class="panel" id="panel-affinity">
-    <div class="panel-head">
-      <h2>会话粘性 <span class="tag" id="affinity-count-tag">AFFINITY</span></h2>
-    </div>
-    <div class="panel-body">
-      <div id="affinity-live" style="display:none">
-        <div class="kpi-val cyan" id="affinity-count">0</div>
-        <div class="hint">粘住会话（跨 turn 复用同一账号）</div>
-        <div class="dist-list" id="affinity-why"></div>
-      </div>
-      <div class="acc-empty" id="affinity-empty">尚无粘性记忆</div>
-      <p class="hint">吃上游 prompt cache 省钱</p>
-    </div>
-  </section>
-
-  <!-- 排队车道 -->
-  <section class="panel" id="panel-gate">
-    <div class="panel-head">
-      <h2>排队车道 <span class="tag" id="gate-count-tag">IDLE</span></h2>
-    </div>
-    <div class="panel-body">
-      <div class="acc-top">
-        <span class="led on" id="gate-led"></span>
-        <span class="acc-name" id="gate-state-text">空闲</span>
-      </div>
-      <div class="acc-meta"><span>排队等待</span><b id="gate-waiting">0</b></div>
-      <p class="hint">免费通道串行门：同一时刻仅一路请求占用免费通道；等待不计账号失败/冷却。</p>
-    </div>
-  </section>
+<!-- ═══ 视图：运维 ═══ -->
+<div class="view" id="view-ops">
 
   <!-- 实时动态 -->
   <section class="panel" id="panel-activity">
@@ -210,26 +214,6 @@
     </div>
     <div class="panel-body">
       <div class="feed" id="activity-feed"><div class="feed-empty">等待请求…</div></div>
-    </div>
-  </section>
-
-  <!-- API 测试台 -->
-  <section class="panel" id="panel-playground">
-    <div class="panel-head">
-      <h2>API 测试台 <span class="tag">PLAYGROUND</span></h2>
-    </div>
-    <div class="panel-body">
-      <div class="pg-row">
-        <select id="pg-model" class="input"><option value="">加载模型中…</option></select>
-        <input id="pg-apikey" class="input" type="password" placeholder="API Key（服务端启用鉴权时填写）" style="max-width:260px">
-        <label class="pg-stream"><input type="checkbox" id="pg-stream" checked> 流式</label>
-      </div>
-      <textarea id="pg-input" class="input" rows="3" placeholder="输入测试消息，回车发送（Shift+Enter 换行）">你好，用一句话介绍你自己。</textarea>
-      <div class="pg-row">
-        <button class="btn primary" id="pg-send" onclick="pgSend()">发 送</button>
-        <span class="pg-meta" id="pg-meta"></span>
-      </div>
-      <pre class="pg-output" id="pg-output">// 响应输出区 — 验证代理链路是否畅通</pre>
     </div>
   </section>
 
@@ -251,6 +235,60 @@
     </div>
   </section>
 
+  <!-- 排队车道 -->
+  <section class="panel" id="panel-gate">
+    <div class="panel-head">
+      <h2>排队车道 <span class="tag" id="gate-count-tag">IDLE</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="acc-top">
+        <span class="led on" id="gate-led"></span>
+        <span class="acc-name" id="gate-state-text">空闲</span>
+      </div>
+      <div class="acc-meta"><span>排队等待</span><b id="gate-waiting">0</b></div>
+      <p class="hint">免费通道串行门：同一时刻仅一路请求占用免费通道；等待不计账号失败/冷却。</p>
+    </div>
+  </section>
+
+  <!-- 会话粘性 -->
+  <section class="panel" id="panel-affinity">
+    <div class="panel-head">
+      <h2>会话粘性 <span class="tag" id="affinity-count-tag">AFFINITY</span></h2>
+    </div>
+    <div class="panel-body">
+      <div id="affinity-live" style="display:none">
+        <div class="kpi-val cyan" id="affinity-count">0</div>
+        <div class="hint">粘住会话（跨 turn 复用同一账号）</div>
+        <div class="dist-list" id="affinity-why"></div>
+      </div>
+      <div class="acc-empty" id="affinity-empty">尚无粘性记忆</div>
+      <p class="hint">吃上游 prompt cache 省钱</p>
+    </div>
+  </section>
+
+  <!-- 语料采集 -->
+  <section class="panel" id="panel-corpus">
+    <div class="panel-head">
+      <h2>语料采集 <span class="tag" id="corpus-count-tag">CORPUS</span></h2>
+    </div>
+    <div class="panel-body">
+      <div class="acc-empty" id="corpus-off">语料采集未启用（config corpus.enabled）</div>
+      <div id="corpus-on" style="display:none">
+        <div class="acc-meta"><span>今日 <b id="corpus-today-count">0</b> 条 · <b id="corpus-today-tokens">0</b> tok</span><span>本月 <b id="corpus-month-count">0</b> 条 · <b id="corpus-month-tokens">0</b> tok</span></div>
+        <div class="acc-meta"><span>模型 top3 <b id="corpus-models">—</b></span></div>
+        <div class="acc-meta"><span>角色 top3 <b id="corpus-roles">—</b></span></div>
+        <div class="acc-meta"><span>注水嫌疑 <b id="corpus-water">0</b></span><span>脱敏命中 <b id="corpus-redact">0</b></span></div>
+        <div class="acc-meta"><span>丢弃 <b id="corpus-discard">0</b></span><span>队列积压 <b id="corpus-backlog">0</b></span></div>
+      </div>
+      <p class="hint">语料落盘 worker 实时计数；按模型 / 角色各取 top3。</p>
+    </div>
+  </section>
+
+</div><!-- /view-ops -->
+
+<!-- ═══ 视图：设置 ═══ -->
+<div class="view" id="view-settings">
+
   <!-- 设置 -->
   <section class="panel" id="panel-settings">
     <div class="panel-head">
@@ -265,8 +303,13 @@
         <button class="btn tiny danger" onclick="clearPassword()">清除密码</button>
       </div>
       <p class="hint">设置密码后，管理接口需登录访问；密码以 SHA256 哈希存储，cookie 同样只存哈希。</p>
+      <div class="danger-zone">
+        <button class="btn tiny danger" onclick="resetTokenStats()">清空全部统计</button>
+      </div>
     </div>
   </section>
+
+</div><!-- /view-settings -->
 
 </main>
 
@@ -312,6 +355,6 @@
 
 <div class="toast-zone" id="toast-zone"></div>
 
-<script src="/static/app.js?v=47"></script>
+<script src="/static/app.js?v=55"></script>
 </body>
 </html>

@@ -125,10 +125,42 @@ body {
 /* ─── 面板网格 ─────────────────────────────────────────────── */
 
 .grid {
+  padding: 16px 28px 28px;
+}
+
+/* ─── 视图切换（单页四视图 display 切换）────────────────────── */
+
+.view { display: none; }
+.view.active {
   display: grid;
   grid-template-columns: repeat(12, 1fr);
   gap: 16px;
-  padding: 16px 28px 28px;
+}
+
+/* 主导航：sticky 于顶栏之下（顶栏约 71px 高） */
+.view-tabs {
+  position: sticky; top: 71px; z-index: 38;
+  display: flex; justify-content: center; flex-wrap: wrap; gap: 10px;
+  padding: 12px 28px;
+  background: rgba(4, 10, 22, 0.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.vtab {
+  font-family: var(--mono);
+  background: rgba(0, 229, 255, 0.06);
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 22px;
+  font-size: 12px; letter-spacing: 3px;
+  cursor: pointer; transition: all 0.15s;
+}
+.vtab:hover { color: var(--text); border-color: var(--line-strong); }
+.vtab.active {
+  color: #fff; background: rgba(0, 229, 255, 0.2);
+  border-color: var(--line-strong);
+  box-shadow: 0 0 14px rgba(0, 229, 255, 0.35);
 }
 
 .panel {
@@ -141,6 +173,15 @@ body {
   min-height: 220px;
 }
 .panel.wide { grid-column: span 8; }
+
+/* 各视图 grid 重排（概览沿用默认 span4/span8，即 connect/playground 窄卡、trend 宽图） */
+#view-channels .panel { grid-column: span 6; }          /* 账号矩阵 / 外部账号 双列宽卡 */
+#view-channels #panel-quality { grid-column: span 12; } /* 账号质量 单列 */
+#view-ops .panel { grid-column: span 6; }               /* 运维两列（activity / logs 常显） */
+#view-ops #panel-gate,
+#view-ops #panel-affinity,
+#view-ops #panel-corpus { grid-column: span 4; }        /* 观测小卡三列 */
+#view-settings .panel { grid-column: span 6; }          /* 设置单列窄卡 */
 
 /* HUD 切角 */
 .panel::before, .panel::after {
@@ -493,9 +534,15 @@ textarea.input { resize: vertical; }
 }
 @media (max-width: 760px) {
   .panel { grid-column: span 12; }
+  /* 窄屏四视图一律退化为单列（视图 id 选择器优先级高于上方 .panel，需显式覆盖） */
+  #view-overview .panel, #view-channels .panel, #view-ops .panel, #view-settings .panel,
+  #view-channels #panel-quality, #view-ops #panel-gate, #view-ops #panel-affinity,
+  #view-ops #panel-corpus, #view-settings #panel-settings { grid-column: span 12; }
   .grid, .kpi-strip { padding-left: 14px; padding-right: 14px; }
   .topbar { padding: 12px 14px; }
   .clock { display: none; }
+  .view-tabs { top: 67px; padding: 10px 14px; }
+  .vtab { padding: 6px 16px; letter-spacing: 1px; }
 }
 
 /* ─── 注水检测模型下拉 ─────────────────────────────────────── */
