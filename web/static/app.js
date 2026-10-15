@@ -723,7 +723,7 @@ function ensureProvidersPanel() {
   return sec;
 }
 
-function renderProviderCard(p) {
+function renderProviderCard(p, _idx, all) {
   const host = (p.base_url || "").replace(/^https?:\/\//, "");
   const stateBadge = p.ok
     ? '<span class="badge on">已连接</span>'
@@ -803,6 +803,19 @@ function renderProviderCard(p) {
   const limitTxt = sub
     ? (sub.hard_limit_usd != null && sub.hard_limit_usd < 1e8 ? `硬限额 <b>$${fmtFull(sub.hard_limit_usd)}</b>` : "限额 <b>不限</b>")
     : `订阅信息不可用（HTTP ${p.subscription_status || "—"}）`;
+  // 计费域切换：模型有交集且启停相反的渠道互为"域对"（如 stepfun API 域 / stepplan 订阅域）。
+  // 两张卡各显一个切换按钮，点击 = 启用目标域 + 停用对侧域（一步切换）。
+  let switchBtn = "";
+  if (Array.isArray(all)) {
+    const partner = all.find(q => q && q.name !== p.name && q.enabled !== p.enabled &&
+      (q.models || []).some(m => (p.models || []).includes(m)));
+    if (partner) {
+      const en = p.enabled !== false;
+      const activate = en ? partner.name : p.name;
+      const deactivate = en ? p.name : partner.name;
+      switchBtn = `<button class="btn tiny ${en ? "" : "primary"}" onclick="switchProviderDomain('${esc(activate)}','${esc(deactivate)}')" title="计费域切换：启用 ${esc(activate)} 并停用 ${esc(deactivate)}">${en ? "切换至 " + esc(partner.name) : "切换到此域"}</button>`;
+    }
+  }
   return `
   <div class="acc-card ${p.ok && p.enabled !== false ? "" : "disabled"}">
     <div class="acc-top">
@@ -816,12 +829,33 @@ function renderProviderCard(p) {
     ${clSection}
     ${keySection}
     <div class="acc-actions">
+      ${switchBtn}
       <button class="btn tiny" onclick="probeModels('${esc(p.name)}')" title="一键探测上游可用模型（GET /models + 1-token 并发探活，最多 40 个/并发 4/单次 20s 超时）">探测模型</button>
       <button class="btn tiny ${p.enabled === false ? "primary" : "danger"}" onclick="toggleProvider('${esc(p.name)}', ${p.enabled === false})">${p.enabled === false ? "启用" : "停用"}</button>
       ${(p.atomcode || p.cline || p.minicode) ? "" : `<button class="btn tiny danger ghost" onclick="removeProvider('${esc(p.name)}')" title="删除整个渠道：config.json providers 节整块移除（本机留有备份可恢复），模型即刻从路由消失">删除</button>`}
     </div>
     ${p.ok ? "" : `<div class="acc-meta"><span class="dim">${esc(p.error || "连接失败")}</span></div>`}
   </div>`;
+}
+
+// 计费域切换：启用 activate 渠道并停用 deactivate 渠道（用于同厂商双计费域，
+// 如 stepfun=API 资源包 / stepplan=订阅 Plan Credit，一启一停互斥切换）
+async function switchProviderDomain(activate, deactivate) {
+  if (!confirm(`计费域切换：启用「${activate}」并停用「${deactivate}」？`)) return;
+  try {
+    const r1 = await api("/api/providers/" + encodeURIComponent(activate) + "/enabled", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    if (!r1.ok) { toast(`启用 ${activate} 失败`); return; }
+    const r2 = await api("/api/providers/" + encodeURIComponent(deactivate) + "/enabled", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: false }),
+    });
+    if (!r2.ok) { toast(`已启用 ${activate}，但停用 ${deactivate} 失败——请手动停用`, true); loadProvidersInfo(); return; }
+    toast(`已切换计费域：${activate} 启用 / ${deactivate} 停用`);
+    loadProvidersInfo();
+  } catch (e) { toast("切换失败: " + e.message, true); }
 }
 
 // T10: Provider 独立启停（POST /api/providers/<name>/enabled，
