@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>免费 Token 资源分享 · QiDi Relay</title>
+<meta name="description" content="QiDi Relay 生产环境实测过的免费 / 低价 token 资源，持续更新。">
+<!-- 复用控制台样式（科技风：深色底 / 等宽字体 / HUD 卡片），不引任何外部 CDN -->
+<link rel="stylesheet" href="/static/app.css?v=56">
+<style>
+/* ═══ 公开栏目页专属布局（只补版面，配色/字体/卡片质感全部复用 app.css 变量） ═══ */
+
+.ft-wrap {
+  padding: 20px 28px 36px;
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 16px;
+  max-width: 1240px;
+  margin: 0 auto;
+}
+/* 本页所有 panel 一律整行（不受控制台四视图栅格分栏影响） */
+.ft-wrap > .panel { grid-column: span 12; min-height: 0; }
+
+.ft-hero { padding: 26px 28px; }
+.ft-hero h1 {
+  font-size: 22px; letter-spacing: 4px; color: #fff;
+  text-shadow: 0 0 12px var(--cyan), 0 0 40px rgba(0, 229, 255, 0.35);
+}
+.ft-lead { margin-top: 10px; font-size: 13px; color: var(--text-dim); letter-spacing: 1px; line-height: 1.8; }
+.ft-hero-meta { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+
+.ft-card-body { display: flex; flex-direction: column; gap: 14px; }
+.ft-card-body h3 {
+  font-size: 12px; letter-spacing: 3px; color: var(--cyan);
+  border-left: 2px solid var(--line-strong); padding-left: 10px;
+  margin-top: 4px;
+}
+.ft-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.ft-list li {
+  font-size: 13px; color: var(--text); line-height: 1.8;
+  padding-left: 16px; position: relative;
+}
+.ft-list li::before { content: "▸"; position: absolute; left: 0; color: var(--cyan); }
+.ft-list li b { color: var(--green); }
+.ft-price { font-size: 13px; line-height: 1.9; color: var(--text); }
+.ft-price b { color: var(--amber); }
+
+.ft-table-wrap { overflow-x: auto; border: 1px solid var(--line); }
+.ft-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ft-table th {
+  font-size: 10px; letter-spacing: 2px; font-weight: 400; color: var(--text-dim);
+  text-align: left; padding: 9px 12px; white-space: nowrap;
+  background: rgba(0, 229, 255, 0.06);
+  border-bottom: 1px solid var(--line);
+}
+.ft-table td {
+  padding: 9px 12px; vertical-align: top; line-height: 1.7;
+  border-bottom: 1px solid rgba(0, 229, 255, 0.08);
+}
+.ft-table tr:last-child td { border-bottom: none; }
+.ft-table tr:hover td { background: rgba(0, 229, 255, 0.05); }
+.ft-table td:first-child { color: #fff; white-space: nowrap; }
+.ft-table td:nth-child(2) { white-space: nowrap; }
+.ft-ok { color: var(--green); }
+.ft-bad { color: var(--red-soft); }
+.ft-warn { color: var(--amber); }
+
+.ft-cta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+  padding: 14px 16px;
+  border: 1px dashed var(--line-strong);
+  background: rgba(0, 229, 255, 0.05);
+}
+.ft-cta code {
+  font-size: 11.5px; color: var(--cyan);
+  word-break: break-all; line-height: 1.6;
+}
+.ft-note { font-size: 11px; color: var(--text-dim); line-height: 1.8; font-style: italic; }
+
+/* 「即将上新」骨架：虚线边框 + 弱化文字，与实卡片同一 class 家族 */
+.panel.soon { border-style: dashed; border-color: var(--line); background: rgba(10, 18, 34, 0.45); min-height: 140px; }
+.panel.soon .panel-head { background: none; }
+.panel.soon .panel-head h2 { color: var(--text-dim); }
+.panel.soon .panel-body { justify-content: center; }
+.panel.soon .ft-soon-text { font-size: 12.5px; color: var(--text-dim); line-height: 1.9; }
+.tag.dim { color: var(--text-dim); border-color: rgba(147, 167, 189, 0.45); background: transparent; }
+
+.ft-foot a { color: var(--cyan); text-decoration: none; }
+.ft-foot a:hover { text-decoration: underline; }
+.ft-foot-line { line-height: 2; }
+
+@media (max-width: 760px) {
+  .ft-wrap { padding: 14px; gap: 12px; }
+  .ft-hero { padding: 20px 18px; }
+  .ft-hero h1 { font-size: 18px; letter-spacing: 2px; }
+  .ft-table { font-size: 11.5px; }
+  .ft-table td:first-child, .ft-table td:nth-child(2) { white-space: normal; }
+}
+</style>
+</head>
+<body>
+<div class="scanlines"></div>
+
+<!-- ═══ 顶栏 ═══ -->
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 40 40" aria-hidden="true">
+      <polygon points="20,3 35,11.5 35,28.5 20,37 5,28.5 5,11.5" fill="none" stroke="currentColor" stroke-width="2"/>
+      <circle cx="20" cy="20" r="5" fill="currentColor"/>
+      <line x1="20" y1="8" x2="20" y2="15" stroke="currentColor" stroke-width="2"/>
+      <line x1="30.5" y1="26" x2="24.5" y2="22.5" stroke="currentColor" stroke-width="2"/>
+      <line x1="9.5" y1="26" x2="15.5" y2="22.5" stroke="currentColor" stroke-width="2"/>
+    </svg>
+    <div class="brand-text">
+      <h1>QiDi&nbsp;Relay</h1>
+      <span class="sub">FREE TOKEN HUB // PUBLIC</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <a class="btn tiny ghost" href="/">← 管理面板</a>
+  </div>
+</header>
+
+<main class="ft-wrap">
+
+  <!-- ═══ 栏目头 ═══ -->
+  <section class="panel ft-hero" id="ft-hero">
+    <h1>免费 Token 资源分享</h1>
+    <p class="ft-lead">我们生产环境实测过的免费/低价 token 资源，持续更新。</p>
+    <div class="ft-hero-meta">
+      <span class="tag">FREE / LOW-COST</span>
+      <span class="tag">VERIFIED IN PRODUCTION</span>
+      <span class="tag dim">无需登录 · 公开栏目</span>
+    </div>
+  </section>
+
+  <!-- ═══ 资源卡片 1：APIGOTO ═══ -->
+  <section class="panel ft-card" id="res-apigoto">
+    <div class="panel-head">
+      <h2>APIGOTO — 统一 LLM API 网关 <span class="tag">400+ 模型 / 70+ 供应商</span></h2>
+      <div class="head-actions"><span class="tag">01</span></div>
+    </div>
+    <div class="panel-body ft-card-body">
+
+      <h3>新用户福利（通过本页推广链接注册）</h3>
+      <ul class="ft-list">
+        <li>注册即送 <b>1 亿 token</b>（有效期 30 天）</li>
+        <li>完成实名认证（网易易盾系统，即用即毁不留存）<b>再送 4 亿 token</b></li>
+        <li>免费版套餐每月 1 日自动刷新；关注公众号不定期领额度重置卡/现金券</li>
+      </ul>
+
+      <h3>价格</h3>
+      <p class="ft-price">平台价 = 官方 <b>0.8 折起</b>；错峰低谷时段半价（如 DeepSeek-Flash 低谷期输入 ¥0.8/百万 token、输出 ¥3.21/百万）</p>
+
+      <h3>我们生产环境跑了数月的模型实测（QiDi Relay 中转集群真实调用数据）</h3>
+      <div class="ft-table-wrap">
+        <table class="ft-table">
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>实测判定</th>
+              <th>证据</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>DeepSeek V4 Pro / Flash / deepseek-flash(1017 最新版)</td>
+              <td class="ft-ok">✅ 真身</td>
+              <td>同 prompt 下 prompt_tokens 恒差 53 的数学铁证（同一 DeepSeek tokenizer）；难题组 5/5</td>
+            </tr>
+            <tr>
+              <td>Claude Opus 5.5</td>
+              <td class="ft-ok">✅ 真身</td>
+              <td>难题组 6/6；自报 Anthropic Claude；tokenizer 家族对照一致</td>
+            </tr>
+            <tr>
+              <td>Claude Haiku 5.5</td>
+              <td class="ft-ok">✅ 真身</td>
+              <td>与 Sonnet 5.5 同渠道 prompt_tokens 恒差 0（同源同厂）；难题组 5/5</td>
+            </tr>
+            <tr>
+              <td>Grok 4.7</td>
+              <td class="ft-ok">✅ 真身</td>
+              <td>难题组 6/6；自报 xAI Grok；分词体系与 Claude 家族差异巨大（非换皮）</td>
+            </tr>
+            <tr>
+              <td>GLM-5.3</td>
+              <td class="ft-ok">✅ 真身</td>
+              <td>多轮生产调用响应正常</td>
+            </tr>
+            <tr>
+              <td>Claude Haiku 4.5 / Doubao-Seed</td>
+              <td class="ft-bad">❌ 注水避雷</td>
+              <td>自报身份错乱（谎报 Claude 3.5 / App-gateway）</td>
+            </tr>
+            <tr>
+              <td>GPT-5.6 Sol / Gemini-4-Pro / Hy4</td>
+              <td class="ft-warn">⚠️ 存疑</td>
+              <td>上游身份未能验证，请自行小额度试用</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>注册链接（本页推广链接，注册即绑定，你获得上述额度，我们获得推广返利，双赢）</h3>
+      <div class="ft-cta">
+        <a class="btn primary" href="https://www.apigoto.com/wechat_oX2xV2dt6vu8jpIdGvpvPHzk_qY8" target="_blank" rel="noopener noreferrer">立即注册 APIGOTO →</a>
+        <code>https://www.apigoto.com/wechat_oX2xV2dt6vu8jpIdGvpvPHzk_qY8</code>
+      </div>
+
+      <p class="ft-note">*注：以上判定基于 2026 年 9-10 月生产环境实测，平台模型供应可能随时间变化，请以注册后控制台实际可用模型为准。</p>
+    </div>
+  </section>
+
+  <!-- ═══ 预留资源位（骨架复用 .panel 类，虚线弱化） ═══ -->
+  <section class="panel soon" id="res-modelscope">
+    <div class="panel-head">
+      <h2>ModelScope 魔粒池 <span class="tag dim">即将上新</span></h2>
+    </div>
+    <div class="panel-body">
+      <p class="ft-soon-text">每日 200 魔粒免费额度自动刷新，Qwen 系全栈模型均可试，适合轻量调用。</p>
+    </div>
+  </section>
+
+  <section class="panel soon" id="res-openrouter">
+    <div class="panel-head">
+      <h2>OpenRouter :free 池 <span class="tag dim">即将上新</span></h2>
+    </div>
+    <div class="panel-body">
+      <p class="ft-soon-text">社区 :free 免费模型池覆盖多家厂商，有限速但零成本，适合对比评测。</p>
+    </div>
+  </section>
+
+  <section class="panel soon" id="res-qoder">
+    <div class="panel-head">
+      <h2>Qoder 限免 <span class="tag dim">即将上新</span></h2>
+    </div>
+    <div class="panel-body">
+      <p class="ft-soon-text">Qoder 平台限时免费模型，适合编码场景快速验证。</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot ft-foot">
+  <div class="ft-foot-line">QiDi Relay · 免费 Token 资源分享 · 公开栏目</div>
+  <div class="ft-foot-line"><a href="/">← 返回管理面板</a> · 栏目说明：本页汇总公开可查的免费/低价 token 资源与我们的生产实测结论，不构成任何推荐；部分链接为推广链接，注册后你可获得对应额度，我们获得推广返利。</div>
+</footer>
+
+</body>
+</html>

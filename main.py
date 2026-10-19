@@ -65,6 +65,18 @@ def knowledge():
     return render_template("knowledge.html")
 
 
+@app.route("/free-tokens")
+def free_tokens():
+    """公开栏目：免费 Token 资源分享（PUBLIC，无需登录）。
+
+    对外分享用页面：生产环境实测过的免费/低价 token 资源清单。
+    刻意注册在 app 上而非 admin 蓝图——蓝图 url_prefix="/api"，
+    页面路径应为 /free-tokens（nginx 8443 → relay 全量转发），
+    与 / 、/knowledge 同级、同样不挂 @check_admin_auth。
+    """
+    return render_template("free-tokens.html")
+
+
 if __name__ == "__main__":
     port = get_port()
     # F 小修：config.json 重复键（大小写折叠后重复，解析时

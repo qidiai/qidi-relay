@@ -3,7 +3,7 @@
 纯读文件校验，不起 Flask、不执行 JS：
   1. index.html 存在四个视图容器 id；
   2. 12 个静态 panel 各恰好归属一个视图容器，且 panel-providers 已静态化进渠道视图；
-  3. 缓存戳 app.css?v=56 / app.js?v=58，且「清空统计」.danger-zone 已从用量分布迁到安全设置。
+  3. 缓存戳 app.css?v=56 / app.js?v=59，且「清空统计」.danger-zone 已从用量分布迁到安全设置。
 
 方案：docs/frontend-regroup-plan.md；
 任务书：一页 14 panel 拆「总览 / 渠道 / 运维 / 设置」四视图，单 HTML display 切换。
@@ -113,7 +113,7 @@ def test_asset_version_and_danger_zone_migration():
     """用例 3：静态资产缓存戳 + 清空统计按钮已从用量分布迁到安全设置。"""
     html = _html()
     assert "app.css?v=56" in html, "app.css 缓存戳应为 v=56"
-    assert "app.js?v=58" in html, "app.js 缓存戳应为 v=58"
+    assert "app.js?v=59" in html, "app.js 缓存戳应为 v=59"
 
     dist = _panel_segment(html, "panel-dist")
     settings = _panel_segment(html, "panel-settings")
