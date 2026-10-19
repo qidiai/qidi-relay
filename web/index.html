@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>QiDi Relay · 局域网中转控制台</title>
-<link rel="stylesheet" href="/static/app.css?v=55">
+<link rel="stylesheet" href="/static/app.css?v=56">
 </head>
 <body>
 <canvas id="bg-canvas"></canvas>
@@ -353,8 +353,23 @@
   </div>
 </div>
 
+<!-- ═══ 刷新模型弹窗（上游模型列表 + 勾选写回） ═══ -->
+<div class="modal" id="refreshModelsModal">
+  <div class="modal-box" style="width:560px">
+    <h3 id="refresh-models-title">刷新模型</h3>
+    <p class="hint" id="refresh-models-status"></p>
+    <div class="refresh-models-list" id="refresh-models-list"></div>
+    <div class="modal-btns">
+      <button class="btn tiny" onclick="selectAllRefreshedModels(true)">全选</button>
+      <button class="btn tiny" onclick="selectAllRefreshedModels(false)">全不选</button>
+      <button class="btn primary" id="refresh-models-save" onclick="saveRefreshedModels()">保存选中模型</button>
+      <button class="btn ghost" onclick="closeModal('refreshModelsModal')">取消</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-zone" id="toast-zone"></div>
 
-<script src="/static/app.js?v=56"></script>
+<script src="/static/app.js?v=57"></script>
 </body>
 </html>

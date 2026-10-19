@@ -1327,6 +1327,18 @@ def _provider_first_key(name: str, p: dict):
     return entries[0]["key"] if entries else None
 
 
+def _provider_first_enabled_key(name: str, p: dict):
+    """provider 的第一个**启用中**的 key（刷新模型鉴权用）。
+
+    与 _provider_first_key 的差别：跳过 F14 停用的 key（额度耗尽停用
+    的凭证不应再拿去访问上游）；全部停用返回 None。
+    """
+    for entry in providers._parse_keys(name, p):
+        if not entry.get("disabled"):
+            return entry["key"]
+    return None
+
+
 def _upstream_model_ids(payload) -> list:
     """从 GET /models 响应体提取模型 id 列表（兼容
     OpenAI {"data":[...]} / 纯对象数组 / 纯字符串数组
@@ -1342,6 +1354,47 @@ def _upstream_model_ids(payload) -> list:
                 and it["id"].strip()):
             out.append(it["id"].strip())
     return out
+
+
+class _UpstreamModelsError(Exception):
+    """上游模型列表拉取失败（异常文本即可读错误文案）。"""
+
+
+_UPSTREAM_MODELS_TIMEOUT_S = 15   # 只拉列表不测活，比探测宽松即可
+_UPSTREAM_HTTP_HINTS = {
+    400: "请求无效",
+    401: "API Key 无效或无权限",
+    403: "API Key 无权访问模型列表",
+    404: "上游无 /models 端点",
+    429: "上游限流，请稍后重试",
+}
+
+
+def _fetch_upstream_models(p: dict, base_url: str, key: str,
+                           timeout: int = _UPSTREAM_MODELS_TIMEOUT_S) -> list:
+    """GET {base_url}/models（带 provider 的 key）→ 上游模型 id 列表。
+
+    探测（T11）与「刷新模型」共用的唯一拉取实现：per-provider 代理
+    出口 + trust_env=False（R-B）；非 200 / 超时 / 连接失败一律归一为
+    _UpstreamModelsError（带可读中文文案，探测端点转 502、刷新端点
+    转 ok=false）。
+    """
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    try:
+        with providers.make_client(p, timeout) as client:
+            r = client.get(base_url + "/models", headers=headers)
+    except httpx.TimeoutException:
+        raise _UpstreamModelsError(f"连接 {base_url} 超时（>{timeout}s）")
+    except Exception as e:
+        raise _UpstreamModelsError(f"连接 {base_url} 失败: {str(e)[:120]}")
+    if r.status_code != 200:
+        hint = _UPSTREAM_HTTP_HINTS.get(r.status_code) or "上游返回异常"
+        raise _UpstreamModelsError(
+            f"上游 GET /models 返回 {r.status_code}（{hint}）")
+    try:
+        return _upstream_model_ids(r.json())
+    except Exception as e:
+        raise _UpstreamModelsError(f"/models 响应解析失败: {e}")
 
 
 def _probe_one(client, base_url: str, key: str, model_id: str):
@@ -1399,20 +1452,12 @@ def api_provider_probe(name):
     key = _provider_first_key(name, p)
     if not base_url or not key:
         return jsonify({"error": f"provider「{name}」配置不完整（缺 base_url/api_keys）"}), 400
-    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
     try:
         # R-B：探针同样走 per-provider 代理出口（面板探测 403 而转发
         # 成功的自相矛盾 UX 必须避免）；trust_env=False + 一次性 client。
-        with providers.make_client(p, 10) as client:
-            r = client.get(base_url + "/models", headers=headers)
-            if r.status_code != 200:
-                return jsonify({"error": f"GET /models 返回 {r.status_code}（{base_url} 无可用模型列表端点）"}), 502
-            try:
-                candidates = _upstream_model_ids(r.json())
-            except Exception as e:
-                return jsonify({"error": f"/models 响应解析失败: {e}"}), 502
-    except Exception as e:
-        return jsonify({"error": f"连接 {base_url} 失败: {str(e)[:120]}"}), 502
+        candidates = _fetch_upstream_models(p, base_url, key, timeout=10)
+    except _UpstreamModelsError as e:
+        return jsonify({"error": str(e)}), 502
     if keyword:
         kl = keyword.lower()
         candidates = [m for m in candidates if kl in m.lower()]
@@ -1432,6 +1477,47 @@ def api_provider_probe(name):
                         fail.append(fail_item)
     return jsonify({"total": len(candidates), "probed": len(probe_set),
                     "ok": ok, "fail": fail})
+
+
+# ─── 刷新上游模型列表（「刷新模型」按钮，轻量、不测活）─────────────
+# GET /providers/<name>/models/upstream：只拉上游 GET /models 的 id
+# 列表（带第一个启用中的 key），不逐个 1-token 测活——上游新增模型
+# 后可一键勾选写回（POST /providers/<name>/models），免手动输入 ID。
+# 响应契约：除 provider 不存在的本地校验外一律 HTTP 200，由前端看
+# ok 字段判断（上游 401/404/超时都进 ok=false + 可读 error 文案）。
+
+
+@bp.route("/providers/<name>/models/upstream", methods=["GET"])
+@check_admin_auth
+def api_provider_models_upstream(name):
+    """拉取上游最新模型列表（刷新模型，不测活）。
+
+    仅对标准外部 provider 开放：带 type 字段的特殊通道
+    （atomcode/cline/minicode/opencode-serve 等——无静态 key 或
+    上游协议/结构与 OpenAI /models 不同）返回明确错误，不发起
+    任何上游请求。
+    """
+    name = str(name or "").strip()
+    p = (load_config().get("providers") or {}).get(name)
+    if not isinstance(p, dict):
+        return jsonify({"ok": False,
+                        "error": f"provider「{name}」不存在"}), 404
+    if p.get("type"):
+        return jsonify({"ok": False,
+                        "error": "该渠道类型不支持列表刷新"})
+    base_url = str(p.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return jsonify({"ok": False,
+                        "error": f"provider「{name}」配置不完整（缺 base_url）"})
+    key = _provider_first_enabled_key(name, p)
+    if not key:
+        return jsonify({"ok": False,
+                        "error": f"provider「{name}」无启用中的 API Key"})
+    try:
+        models = _fetch_upstream_models(p, base_url, key)
+    except _UpstreamModelsError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "models": models})
 
 
 def _set_provider_models(name: str, models: list) -> None:

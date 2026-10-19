@@ -110,10 +110,10 @@ def test_each_panel_belongs_to_exactly_one_view():
 
 
 def test_asset_version_and_danger_zone_migration():
-    """用例 3：缓存戳 v=55 + 清空统计按钮已从用量分布迁到安全设置。"""
+    """用例 3：静态资产缓存戳 + 清空统计按钮已从用量分布迁到安全设置。"""
     html = _html()
     assert "app.css?v=55" in html, "app.css 缓存戳应为 v=55"
-    assert "app.js?v=56" in html, "app.js 缓存戳应为 v=55"
+    assert "app.js?v=57" in html, "app.js 缓存戳应为 v=57"
 
     dist = _panel_segment(html, "panel-dist")
     settings = _panel_segment(html, "panel-settings")

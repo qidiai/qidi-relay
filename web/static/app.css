@@ -352,6 +352,36 @@ textarea.input { resize: vertical; }
 .badge.ext { color: var(--cyan); border-color: rgba(0, 229, 255, 0.3); background: rgba(0, 229, 255, 0.05); }
 .acc-meta .dim { color: var(--text-dim); }
 
+/* 模型徽章折叠：>8 个默认收前 8 个，点「共 N 个 ▾」展开（账号卡/渠道卡统一） */
+.acc-badges .badge.model-extra { display: none; }
+.acc-badges.badges-open .badge.model-extra { display: inline-block; }
+.badge.model-toggle { cursor: pointer; font-family: inherit; }
+.badge.model-toggle:hover { background: rgba(0, 229, 255, 0.14); }
+
+/* 刷新模型模态：可滚动 checkbox 列表 + 新增/下架标注 */
+.refresh-models-list {
+  max-height: 320px; overflow-y: auto;
+  border: 1px solid var(--line); padding: 8px 10px; margin-top: 10px;
+  background: rgba(6, 12, 24, 0.6);
+}
+.refresh-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 3px 2px; font-size: 12px; color: var(--text); cursor: pointer;
+}
+.refresh-row:hover { background: rgba(0, 229, 255, 0.05); }
+.refresh-row .refresh-model-id {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono);
+}
+.refresh-row.is-new .refresh-model-id { color: var(--green); }
+.refresh-row.is-removed { opacity: 0.6; }
+.refresh-row.is-removed .refresh-model-id { color: var(--text-dim); text-decoration: line-through; }
+.refresh-sep {
+  margin: 8px 0 2px; padding-top: 6px; border-top: 1px dashed var(--line);
+  font-size: 10px; letter-spacing: 1px; color: var(--text-dim);
+}
+.refresh-models-list .dim { color: var(--text-dim); }
+
 /* ─── 进行中请求面板 ───────────────────────────────────────── */
 
 .inflight-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }

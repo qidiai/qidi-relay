@@ -284,6 +284,7 @@ async function logout() {
 // 上游账号信息（/api/accounts/upstream，服务端 120s 缓存；旧后端未重启时静默跳过）
 let upstreamMap = {};      // user_id -> 上游信息
 let providersSupported = true; // /api/providers/info 不存在（404）时置 false 并隐藏面板
+let providersCache = [];   // 最近一次 /api/providers/info 的渠道列表（刷新模型比对当前已选）
 
 function fmtSpend(n) {
   return Number(n || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -723,6 +724,30 @@ function ensureProvidersPanel() {
   return sec;
 }
 
+// 模型徽章折叠（任务：37 个模型全平铺太占空间）：>8 个默认只显示前 8 个
+// + 「共 N 个 ▾」切换按钮；点击展开全量（按钮变「收起 ▴」），再点收回。
+// 账号卡/渠道卡共用 .acc-badges 容器——容器级 class 切换保证统一行为。
+const MODEL_BADGE_LIMIT = 8;
+
+function renderModelBadges(models) {
+  const list = (models || []).filter(m => m != null && String(m) !== "");
+  if (list.length <= MODEL_BADGE_LIMIT) {
+    return list.map(m => `<span class="badge ext">${esc(m)}</span>`).join("");
+  }
+  const badges = list.map((m, i) =>
+    `<span class="badge ext${i >= MODEL_BADGE_LIMIT ? " model-extra" : ""}">${esc(m)}</span>`).join("");
+  return badges +
+    `<button type="button" class="badge ext model-toggle" data-total="${list.length}" onclick="toggleModelBadges(this)" title="展开全部 ${list.length} 个模型">共 ${list.length} 个 ▾</button>`;
+}
+
+function toggleModelBadges(btn) {
+  const box = btn.closest(".acc-badges");
+  if (!box) return;
+  const open = box.classList.toggle("badges-open");
+  btn.textContent = open ? "收起 ▴" : `共 ${btn.dataset.total} 个 ▾`;
+  btn.title = open ? "收起模型列表" : `展开全部 ${btn.dataset.total} 个模型`;
+}
+
 function renderProviderCard(p, _idx, all) {
   const host = (p.base_url || "").replace(/^https?:\/\//, "");
   const stateBadge = p.ok
@@ -738,7 +763,7 @@ function renderProviderCard(p, _idx, all) {
     ? `<span class="badge off" title="已停用的 key 保留在池中但不参与路由轮换，可随时启用">${p.key_disabled_count} 停用</span>` : "";
   const sub = p.subscription || null;
   const payBadge = sub && sub.has_payment_method ? '<span class="badge glm">已绑支付方式</span>' : "";
-  const modelBadges = (p.models || []).map(m => `<span class="badge ext">${esc(m)}</span>`).join("");
+  const modelBadges = renderModelBadges(p.models);
   // AtomCode 多账号列表 + 凭证上传表单
   let acSection = "";
   if (p.atomcode && p.accounts) {
@@ -831,6 +856,7 @@ function renderProviderCard(p, _idx, all) {
     <div class="acc-actions">
       ${switchBtn}
       <button class="btn tiny" onclick="probeModels('${esc(p.name)}')" title="一键探测上游可用模型（GET /models + 1-token 并发探活，最多 40 个/并发 4/单次 20s 超时）">探测模型</button>
+      <button class="btn tiny" onclick="refreshProviderModels('${esc(p.name)}')" title="从上游 GET /models 拉取最新模型列表（不测活，快速），勾选后写回渠道配置">↻ 刷新模型</button>
       <button class="btn tiny ${p.enabled === false ? "primary" : "danger"}" onclick="toggleProvider('${esc(p.name)}', ${p.enabled === false})">${p.enabled === false ? "启用" : "停用"}</button>
       ${(p.atomcode || p.cline || p.minicode) ? "" : `<button class="btn tiny danger ghost" onclick="removeProvider('${esc(p.name)}')" title="删除整个渠道：config.json providers 节整块移除（本机留有备份可恢复），模型即刻从路由消失">删除</button>`}
     </div>
@@ -1058,6 +1084,116 @@ async function saveProbeModels() {
   } catch (e) { toast("保存失败: " + e.message, true); }
 }
 
+// ─── 刷新上游模型列表（不测活）────────────────────────────────────
+// GET /api/providers/<name>/models/upstream → 上游最新 id 列表；
+// 模态里勾选后 POST /api/providers/<name>/models 写回。当前渠道
+// 已选的默认打勾；上游新增的绿色「新」标；上游已下架的灰字标注
+// 且默认不勾（保存=移除）。
+let refreshModelsProvider = null;
+let refreshModelsBusy = false;
+
+async function refreshProviderModels(pname) {
+  if (refreshModelsBusy) return;
+  refreshModelsProvider = pname;
+  refreshModelsBusy = true;
+  $("refresh-models-title").textContent = `刷新模型 - ${pname}`;
+  $("refresh-models-status").textContent = "正在从上游拉取模型列表…";
+  $("refresh-models-list").innerHTML = "";
+  const saveBtn = $("refresh-models-save");
+  saveBtn.disabled = true;
+  openModal("refreshModelsModal");
+  try {
+    const r = await api("/api/providers/" + encodeURIComponent(pname) + "/models/upstream");
+    const d = await r.json();
+    if (!d.ok) {
+      closeModal("refreshModelsModal");
+      toast(d.error || `刷新失败（HTTP ${r.status}）`, true);
+      return;
+    }
+    renderRefreshedModels(pname, d.models || []);
+    saveBtn.disabled = false;
+  } catch (e) {
+    closeModal("refreshModelsModal");
+    toast("刷新失败: " + e.message, true);
+  } finally {
+    refreshModelsBusy = false;
+  }
+}
+
+// 当前渠道已配置的直辖模型（/api/providers/info 的 models 含
+// "别名 ⇒ 上游ID" 展示项，别名不是上游模型，排除以免误标"已下架"）
+function providerCurrentModels(pname) {
+  const p = (providersCache || []).find(x => x && x.name === pname);
+  return ((p && p.models) || []).filter(
+    m => typeof m === "string" && m && !m.includes("\u21d2"));
+}
+
+function renderRefreshedModels(pname, upstream) {
+  const current = providerCurrentModels(pname);
+  const curSet = new Set(current);
+  const upSet = new Set(upstream);
+  const added = upstream.filter(m => !curSet.has(m));
+  const removed = current.filter(m => !upSet.has(m));
+  const rows = upstream.map(m => {
+    const isNew = !curSet.has(m);
+    return `<label class="refresh-row${isNew ? " is-new" : ""}">` +
+      `<input type="checkbox" class="refresh-model-cb" value="${esc(m)}"${curSet.has(m) ? " checked" : ""}>` +
+      `<span class="refresh-model-id">${esc(m)}</span>` +
+      (isNew ? '<span class="badge on">新</span>' : "") +
+      `</label>`;
+  }).join("");
+  const removedRows = removed.map(m =>
+    `<label class="refresh-row is-removed">` +
+    `<input type="checkbox" class="refresh-model-cb" value="${esc(m)}">` +
+    `<span class="refresh-model-id">${esc(m)}</span>` +
+    '<span class="badge off">上游已下架</span></label>').join("");
+  $("refresh-models-list").innerHTML =
+    (rows || '<div class="dim" style="padding:4px 0">上游未返回任何模型</div>') +
+    (removedRows
+      ? `<div class="refresh-sep">当前有、上游没有（默认不勾选 = 保存后移除）</div>${removedRows}`
+      : "");
+  $("refresh-models-status").textContent =
+    `上游 ${upstream.length} 个 · 当前已选 ${current.filter(m => upSet.has(m)).length} 个 · ` +
+    `新增 ${added.length} 个 · 上游已下架 ${removed.length} 个`;
+}
+
+function selectAllRefreshedModels(checked) {
+  document.querySelectorAll("#refresh-models-list .refresh-model-cb")
+    .forEach(cb => { cb.checked = checked; });
+}
+
+async function saveRefreshedModels() {
+  if (!refreshModelsProvider || refreshModelsBusy) return;
+  const checked = Array.from(
+    document.querySelectorAll("#refresh-models-list .refresh-model-cb:checked"))
+    .map(cb => cb.value);
+  if (!checked.length) { toast("未勾选任何模型（至少保留一个）", true); return; }
+  const pname = refreshModelsProvider;
+  const btn = $("refresh-models-save");
+  refreshModelsBusy = true;
+  btn.disabled = true;
+  btn.textContent = "保存中…";
+  try {
+    const r = await api("/api/providers/" + encodeURIComponent(pname) + "/models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ models: checked }),
+    });
+    const d = await r.json();
+    if (r.ok && !d.error) {
+      toast(`已保存 ${d.models.length} 个模型到「${d.provider}」（立即生效）`);
+      closeModal("refreshModelsModal");
+      loadProvidersInfo();
+    } else {
+      toast(d.error || "保存失败", true);
+    }
+  } catch (e) { toast("保存失败: " + e.message, true); }
+  finally {
+    refreshModelsBusy = false;
+    btn.disabled = false;
+    btn.textContent = "保存选中模型";
+  }
+}
+
 // T11-F3: 账号分组标签选择器（POST /api/accounts/<uid>/group，
 // accounts.json 条目 span 文本级编辑，change 即存）
 const GROUP_LABEL = { "": "订阅池", free: "免费组", pro: "专业组" };
@@ -1175,6 +1311,7 @@ async function loadProvidersInfo() {
     if (r.status === 404) { providersSupported = false; const s = $("panel-providers"); if (s) s.style.display = "none"; return; } // 旧后端无此接口
     const d = await r.json();
     const provs = d.providers || [];
+    providersCache = provs;
     const sec = ensureProvidersPanel();
     if (!sec) return;
     if (!provs.length) { sec.style.display = "none"; return; } // 未配置外部 provider：隐藏面板（保留原行为）
