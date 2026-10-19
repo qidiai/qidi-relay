@@ -727,23 +727,38 @@ function ensureProvidersPanel() {
 // 模型徽章折叠（任务：37 个模型全平铺太占空间）：>8 个默认只显示前 8 个
 // + 「共 N 个 ▾」切换按钮；点击展开全量（按钮变「收起 ▴」），再点收回。
 // 账号卡/渠道卡共用 .acc-badges 容器——容器级 class 切换保证统一行为。
+// J-1：展开状态按 provider name 存模块级 Set（不在 DOM 上），
+// 60s 轮询/任意操作整体重写 #provider-grid 后仍能回填 badges-open。
 const MODEL_BADGE_LIMIT = 8;
+const expandedProviderBadges = new Set();
+// /api/providers/info 不返回 type 字段，特殊通道按钮显隐需要它：
+// 按渠道名集合指纹从 /api/config 补齐（仅在渠道增删时重新拉取）。
+let providerTypesCache = {};
+let providerTypesFp = null;
 
-function renderModelBadges(models) {
+function renderModelBadges(models, pname) {
   const list = (models || []).filter(m => m != null && String(m) !== "");
   if (list.length <= MODEL_BADGE_LIMIT) {
     return list.map(m => `<span class="badge ext">${esc(m)}</span>`).join("");
   }
+  const open = pname != null && expandedProviderBadges.has(pname);
   const badges = list.map((m, i) =>
     `<span class="badge ext${i >= MODEL_BADGE_LIMIT ? " model-extra" : ""}">${esc(m)}</span>`).join("");
   return badges +
-    `<button type="button" class="badge ext model-toggle" data-total="${list.length}" onclick="toggleModelBadges(this)" title="展开全部 ${list.length} 个模型">共 ${list.length} 个 ▾</button>`;
+    `<button type="button" class="badge ext model-toggle" data-total="${list.length}"` +
+    (pname != null ? ` data-pname="${esc(pname)}"` : "") +
+    ` onclick="toggleModelBadges(this)" title="${open ? "收起模型列表" : `展开全部 ${list.length} 个模型`}">${open ? "收起 ▴" : `共 ${list.length} 个 ▾`}</button>`;
 }
 
 function toggleModelBadges(btn) {
   const box = btn.closest(".acc-badges");
   if (!box) return;
   const open = box.classList.toggle("badges-open");
+  const pname = btn.dataset.pname;
+  if (pname) {
+    if (open) expandedProviderBadges.add(pname);
+    else expandedProviderBadges.delete(pname);
+  }
   btn.textContent = open ? "收起 ▴" : `共 ${btn.dataset.total} 个 ▾`;
   btn.title = open ? "收起模型列表" : `展开全部 ${btn.dataset.total} 个模型`;
 }
@@ -763,7 +778,7 @@ function renderProviderCard(p, _idx, all) {
     ? `<span class="badge off" title="已停用的 key 保留在池中但不参与路由轮换，可随时启用">${p.key_disabled_count} 停用</span>` : "";
   const sub = p.subscription || null;
   const payBadge = sub && sub.has_payment_method ? '<span class="badge glm">已绑支付方式</span>' : "";
-  const modelBadges = renderModelBadges(p.models);
+  const modelBadges = renderModelBadges(p.models, p.name);
   // AtomCode 多账号列表 + 凭证上传表单
   let acSection = "";
   if (p.atomcode && p.accounts) {
@@ -841,6 +856,12 @@ function renderProviderCard(p, _idx, all) {
       switchBtn = `<button class="btn tiny ${en ? "" : "primary"}" onclick="switchProviderDomain('${esc(activate)}','${esc(deactivate)}')" title="计费域切换：启用 ${esc(activate)} 并停用 ${esc(deactivate)}">${en ? "切换至 " + esc(partner.name) : "切换到此域"}</button>`;
     }
   }
+  // N-6：带 type 的特殊通道（atomcode/cline/minicode/opencode-serve 等）
+  // 不支持标准 /models 列表刷新——按钮直接不渲染（后端 1504-1506 仍兜底拒绝）。
+  // /api/providers/info 不透出 type，故 type 由 ensureProviderTypes 从
+  // /api/config 补齐（按渠道名集合指纹缓存，避免频繁拉全量配置）。
+  const providerType = p.type || providerTypesCache[p.name] || "";
+  const specialChannel = !!(providerType || p.atomcode || p.cline || p.minicode);
   return `
   <div class="acc-card ${p.ok && p.enabled !== false ? "" : "disabled"}">
     <div class="acc-top">
@@ -848,7 +869,7 @@ function renderProviderCard(p, _idx, all) {
       <span class="acc-name">${esc(p.name)}</span>
       <span class="acc-id">${esc(host)}</span>
     </div>
-    <div class="acc-badges">${stateBadge}${enBadge}${keyBadge}${disBadge}${payBadge}${modelBadges}</div>
+    <div class="acc-badges${expandedProviderBadges.has(p.name) ? " badges-open" : ""}">${stateBadge}${enBadge}${keyBadge}${disBadge}${payBadge}${modelBadges}</div>
     ${(p.atomcode || p.cline) ? "" : `<div class="acc-meta"><span>累计用量 <b>${usageTxt}</b></span><span>${limitTxt}</span></div>`}
     ${acSection}
     ${clSection}
@@ -856,7 +877,7 @@ function renderProviderCard(p, _idx, all) {
     <div class="acc-actions">
       ${switchBtn}
       <button class="btn tiny" onclick="probeModels('${esc(p.name)}')" title="一键探测上游可用模型（GET /models + 1-token 并发探活，最多 40 个/并发 4/单次 20s 超时）">探测模型</button>
-      <button class="btn tiny" onclick="refreshProviderModels('${esc(p.name)}')" title="从上游 GET /models 拉取最新模型列表（不测活，快速），勾选后写回渠道配置">↻ 刷新模型</button>
+      ${specialChannel ? "" : `<button class="btn tiny" onclick="refreshProviderModels('${esc(p.name)}')" title="从上游 GET /models 拉取最新模型列表（不测活，快速），勾选后写回渠道配置">↻ 刷新模型</button>`}
       <button class="btn tiny ${p.enabled === false ? "primary" : "danger"}" onclick="toggleProvider('${esc(p.name)}', ${p.enabled === false})">${p.enabled === false ? "启用" : "停用"}</button>
       ${(p.atomcode || p.cline || p.minicode) ? "" : `<button class="btn tiny danger ghost" onclick="removeProvider('${esc(p.name)}')" title="删除整个渠道：config.json providers 节整块移除（本机留有备份可恢复），模型即刻从路由消失">删除</button>`}
     </div>
@@ -1091,6 +1112,33 @@ async function saveProbeModels() {
 // 且默认不勾（保存=移除）。
 let refreshModelsProvider = null;
 let refreshModelsBusy = false;
+// J-2：模态打开时的渠道实时基线（models + key 集合），保存前对比。
+let refreshModelsBaseline = null;
+
+// 读 /api/config 取渠道实时值（/api/providers/info 有 120s 服务端缓存，
+// 不能作为多标签页 lost update 的 diff 基线；/api/config 每次读盘无缓存）。
+async function fetchProviderLiveSnapshot(pname) {
+  const r = await api("/api/config");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const cfg = await r.json();
+  const p = ((cfg || {}).providers || {})[pname];
+  const exists = !!(p && typeof p === "object");
+  const rawKeys = !exists ? [] : (p.api_key != null ? [p.api_key]
+    : (Array.isArray(p.api_keys) ? p.api_keys : []));
+  return {
+    exists,
+    models: exists && Array.isArray(p.models)
+      ? p.models.filter(m => typeof m === "string") : [],
+    keysFp: JSON.stringify(rawKeys),
+  };
+}
+
+function providerSnapshotChanged(base, live) {
+  if (!base || !live) return false; // 拿不到基线/实时值 → 不阻断保存
+  if (!!base.exists !== !!live.exists) return true;
+  return base.keysFp !== live.keysFp ||
+    base.models.join("\u0000") !== live.models.join("\u0000");
+}
 
 async function refreshProviderModels(pname) {
   if (refreshModelsBusy) return;
@@ -1103,14 +1151,18 @@ async function refreshProviderModels(pname) {
   saveBtn.disabled = true;
   openModal("refreshModelsModal");
   try {
-    const r = await api("/api/providers/" + encodeURIComponent(pname) + "/models/upstream");
+    const [r, live] = await Promise.all([
+      api("/api/providers/" + encodeURIComponent(pname) + "/models/upstream"),
+      fetchProviderLiveSnapshot(pname).catch(() => null),
+    ]);
     const d = await r.json();
     if (!d.ok) {
       closeModal("refreshModelsModal");
       toast(d.error || `刷新失败（HTTP ${r.status}）`, true);
       return;
     }
-    renderRefreshedModels(pname, d.models || []);
+    refreshModelsBaseline = live;
+    renderRefreshedModels(pname, d.models || [], live ? live.models : null);
     saveBtn.disabled = false;
   } catch (e) {
     closeModal("refreshModelsModal");
@@ -1128,38 +1180,81 @@ function providerCurrentModels(pname) {
     m => typeof m === "string" && m && !m.includes("\u21d2"));
 }
 
-function renderRefreshedModels(pname, upstream) {
-  const current = providerCurrentModels(pname);
+function renderRefreshedModels(pname, upstream, currentOverride) {
+  const current = Array.isArray(currentOverride)
+    ? currentOverride.filter(m => typeof m === "string" && m)
+    : providerCurrentModels(pname);
   const curSet = new Set(current);
   const upSet = new Set(upstream);
   const added = upstream.filter(m => !curSet.has(m));
   const removed = current.filter(m => !upSet.has(m));
-  const rows = upstream.map(m => {
+  // N-10：上游模型名是外部输入——checkbox/文本一律 createElement +
+  // 属性/textContent 赋值，不拼 HTML 字符串（含引号也不会破坏结构）。
+  const list = $("refresh-models-list");
+  list.innerHTML = "";
+  upstream.forEach(m => {
     const isNew = !curSet.has(m);
-    return `<label class="refresh-row${isNew ? " is-new" : ""}">` +
-      `<input type="checkbox" class="refresh-model-cb" value="${esc(m)}"${curSet.has(m) ? " checked" : ""}>` +
-      `<span class="refresh-model-id">${esc(m)}</span>` +
-      (isNew ? '<span class="badge on">新</span>' : "") +
-      `</label>`;
-  }).join("");
-  const removedRows = removed.map(m =>
-    `<label class="refresh-row is-removed">` +
-    `<input type="checkbox" class="refresh-model-cb" value="${esc(m)}">` +
-    `<span class="refresh-model-id">${esc(m)}</span>` +
-    '<span class="badge off">上游已下架</span></label>').join("");
-  $("refresh-models-list").innerHTML =
-    (rows || '<div class="dim" style="padding:4px 0">上游未返回任何模型</div>') +
-    (removedRows
-      ? `<div class="refresh-sep">当前有、上游没有（默认不勾选 = 保存后移除）</div>${removedRows}`
-      : "");
+    const label = document.createElement("label");
+    label.className = "refresh-row" + (isNew ? " is-new" : "");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "refresh-model-cb";
+    cb.value = m;
+    cb.checked = curSet.has(m);
+    const id = document.createElement("span");
+    id.className = "refresh-model-id";
+    id.textContent = m;
+    label.append(cb, id);
+    if (isNew) {
+      const b = document.createElement("span");
+      b.className = "badge on";
+      b.textContent = "新";
+      label.append(b);
+    }
+    list.append(label);
+  });
+  if (!upstream.length) {
+    const empty = document.createElement("div");
+    empty.className = "dim";
+    empty.style.padding = "4px 0";
+    empty.textContent = "上游未返回任何模型";
+    list.append(empty);
+  }
+  if (removed.length) {
+    const sep = document.createElement("div");
+    sep.className = "refresh-sep";
+    sep.textContent = "当前有、上游没有（默认不勾选 = 保存后移除）";
+    list.append(sep);
+    removed.forEach(m => {
+      const label = document.createElement("label");
+      label.className = "refresh-row is-removed";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.className = "refresh-model-cb";
+      cb.value = m;
+      const id = document.createElement("span");
+      id.className = "refresh-model-id";
+      id.textContent = m;
+      const b = document.createElement("span");
+      b.className = "badge off";
+      b.textContent = "上游已下架";
+      label.append(cb, id, b);
+      list.append(label);
+    });
+  }
   $("refresh-models-status").textContent =
     `上游 ${upstream.length} 个 · 当前已选 ${current.filter(m => upSet.has(m)).length} 个 · ` +
     `新增 ${added.length} 个 · 上游已下架 ${removed.length} 个`;
 }
 
 function selectAllRefreshedModels(checked) {
-  document.querySelectorAll("#refresh-models-list .refresh-model-cb")
-    .forEach(cb => { cb.checked = checked; });
+  // N-3：全选只作用于上游在售行；.is-removed（已下架）默认不勾 = 保存后移除，
+  // 「全选」不应把它们重新写回配置。
+  document.querySelectorAll("#refresh-models-list .refresh-row").forEach(row => {
+    if (checked && row.classList.contains("is-removed")) return;
+    const cb = row.querySelector(".refresh-model-cb");
+    if (cb) cb.checked = checked;
+  });
 }
 
 async function saveRefreshedModels() {
@@ -1174,12 +1269,22 @@ async function saveRefreshedModels() {
   btn.disabled = true;
   btn.textContent = "保存中…";
   try {
+    // J-2：写回前用 /api/config 实时值校验模态打开时的基线——models 或
+    // key 集合在打开期间被其它标签页改过时先征得用户确认（后端
+    // _set_provider_models 是 models 全量替换，直接写会静默覆盖他人更新）。
+    let live = null;
+    try { live = await fetchProviderLiveSnapshot(pname); } catch (e) { live = null; }
+    if (providerSnapshotChanged(refreshModelsBaseline, live)) {
+      const go = confirm("该渠道在模态打开期间已被修改（可能其它标签页），仍要保存吗？");
+      if (!go) return;
+    }
     const r = await api("/api/providers/" + encodeURIComponent(pname) + "/models", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ models: checked }),
     });
     const d = await r.json();
     if (r.ok && !d.error) {
+      refreshModelsBaseline = null;
       toast(`已保存 ${d.models.length} 个模型到「${d.provider}」（立即生效）`);
       closeModal("refreshModelsModal");
       loadProvidersInfo();
@@ -1304,6 +1409,27 @@ async function toggleProviderKey(pname, label, disabled) {
   } catch (e) { toast("操作失败: " + e.message, true); }
 }
 
+// N-6：/api/providers/info 不透出 provider 的 type（opencode-serve 等特殊
+// 通道因此无法判型）。按渠道名集合指纹从 /api/config 补齐；失败保持旧缓存，
+// 按钮仍按普通渠道渲染（点击后由后端确定性拒绝，无破坏性）。
+async function ensureProviderTypes(names) {
+  const fp = names.slice().sort().join("\u0000");
+  if (providerTypesFp === fp) return;
+  try {
+    const r = await api("/api/config");
+    if (!r.ok) return;
+    const cfg = await r.json();
+    const provs = (cfg && cfg.providers) || {};
+    const map = {};
+    Object.keys(provs).forEach(n => {
+      const p = provs[n];
+      if (p && typeof p === "object" && p.type) map[n] = String(p.type);
+    });
+    providerTypesCache = map;
+    providerTypesFp = fp;
+  } catch (e) { /* 忽略：保持旧缓存 */ }
+}
+
 async function loadProvidersInfo() {
   if (!isAdmin || !providersSupported) return;
   try {
@@ -1312,9 +1438,12 @@ async function loadProvidersInfo() {
     const d = await r.json();
     const provs = d.providers || [];
     providersCache = provs;
+    const liveNames = new Set(provs.map(p => p && p.name));
+    for (const n of expandedProviderBadges) if (!liveNames.has(n)) expandedProviderBadges.delete(n);
     const sec = ensureProvidersPanel();
     if (!sec) return;
     if (!provs.length) { sec.style.display = "none"; return; } // 未配置外部 provider：隐藏面板（保留原行为）
+    await ensureProviderTypes(provs.map(p => p && p.name).filter(Boolean));
     sec.style.display = ""; // 面板已静态化，需显式恢复显示
     $("provider-count-tag").textContent = `${provs.length} LINKED`;
     $("provider-grid").innerHTML = provs.map(renderProviderCard).join("");

@@ -360,7 +360,7 @@
     <p class="hint" id="refresh-models-status"></p>
     <div class="refresh-models-list" id="refresh-models-list"></div>
     <div class="modal-btns">
-      <button class="btn tiny" onclick="selectAllRefreshedModels(true)">全选</button>
+      <button class="btn tiny" onclick="selectAllRefreshedModels(true)" title="全选上游在售模型（不含已下架）">全选</button>
       <button class="btn tiny" onclick="selectAllRefreshedModels(false)">全不选</button>
       <button class="btn primary" id="refresh-models-save" onclick="saveRefreshedModels()">保存选中模型</button>
       <button class="btn ghost" onclick="closeModal('refreshModelsModal')">取消</button>
@@ -370,6 +370,6 @@
 
 <div class="toast-zone" id="toast-zone"></div>
 
-<script src="/static/app.js?v=57"></script>
+<script src="/static/app.js?v=58"></script>
 </body>
 </html>
