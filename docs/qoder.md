@@ -39,5 +39,12 @@ GLM-5.3/Flash/5.2 + Kimi-K3 + DeepSeek-V4 系，作为**第二供应线**削峰�
 
 - 桥挂了：`schtasks /run /tn qoder2api`（或重启计划任务）
 - 加账号：面板 `[+ 添加账号]`（OAuth/PAT/桌面导入三条路）
-- 每日签到：桥内置 scheduler（100 credits/天，`/scheduler` 管理）
+- 每日签到：桥内置 scheduler **已启用并实证**——每天 09:00/21:00 两次
+  自动签到（每次 +100 积分），22:00 Token 集中保活；启动巡检带
+  mark-before-act 防重放（崩溃重启不会重复领取）。2026-10-20 启动
+  巡检已自动领到当日 +100。手动触发：面板或 `POST /accounts/checkin`
+  （需 X-Panel-Token）。
+- 保活看门狗：计划任务 `qoder2api-keepalive`（08:50）+
+  `qoder2api-keepalive-2`（20:50）——签到窗口前检查 8790，桥挂了
+  自动拉起，不错过签到窗口
 - 撤渠道：删 `providers.qoder` 配置节即热失效
