@@ -1436,15 +1436,11 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
             if prov:
                 return _forward_external(data, model, prov)
 
-    # ── GLM-5.3 直连改写（0903）─────────────────────────────────
-    # 上游已收回全部团队的 GLM-5.3 直连权限（team_model_access_denied 401），
-    # 现在只有 codely-core（后端即 glm-5.3）可达。请求 GLM-5.3 的客户端
-    # 统一改写为 codely-core 转发，无感知恢复服务。
-    if model == "GLM-5.3":
-        log.info("模型改写: GLM-5.3 → codely-core（上游已收回直连权限）")
-        activity.add("info", "GLM-5.3→codely-core（直连被收回）", model=model, status="rewrite")
-        data["model"] = "codely-core"
-        model = "codely-core"
+    # ── GLM-5.3 直连改写（0903 已于 1019 撤销）───────────────────
+    # 0903 上游曾收回全部团队 GLM-5.3 直连权限，当时加了自动改写
+    # GLM-5.3 → codely-core。1019 实测 GLM-5.3 直连已恢复（39640/58863），
+    # 且 codely-core 别名后端已切换为 DeepSeek-V4.1-Flash（不再是 GLM），
+    # 保留改写会把 GLM 请求错路由成 DeepSeek → 撤销。
 
     is_stream = data.get("stream", False)
     # ── thinking 模型 tool_choice 守卫（0831）─────────────────────

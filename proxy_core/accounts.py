@@ -255,6 +255,24 @@ class AccountManager:
                                 model, [a["user_id"] for a in glm_all])
                     enabled = glm_all
 
+        # ── 模型→账号定向绑定（1019）────────────────────────────────
+        # 个别新模型只有个别账号有权限（如 GLM-5.3-FLASHX /
+        # Tencent-Hy4-Preview 仅 39640），轮询打到无权限账号会 404
+        # model_not_found。config.json "model_accounts" 声明
+        # {模型: [user_id, ...]}，命中则收窄候选；指定账号全不可用
+        # 时如实 503（无权限账号打上去也是 404，回退没有意义）。
+        ma = (load_config().get("model_accounts") or {})
+        allow = ma.get(model) or ma.get(model.lower())
+        if allow:
+            narrowed = [a for a in enabled if a["user_id"] in allow]
+            if narrowed:
+                enabled = narrowed
+                log.info("定向绑定: %s → %s", model, [a["user_id"] for a in narrowed])
+            else:
+                log.warning("定向绑定: %s 指定账号 %s 均不可用（冷却/禁用）",
+                            model, allow)
+                return None
+
         # 会话粘性（阶段 B / 方案 §4）：prefer 账号在分组/
         # 资格过滤后的候选内（启用、未冷却、符合模型分组与
         # GLM/KIMI 资格）时直接选它（仍忽略负载感知）；不在
