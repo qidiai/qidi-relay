@@ -86,6 +86,57 @@ def _write_jsonl(path, objs):
         encoding="utf-8")
 
 
+# 富列老表（云端旧构建 relay_corpus.db 的真实 schema）
+_RICH_TABLE_DDL = (
+    "CREATE TABLE corpus ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " ts TEXT, user_id TEXT, api_key_label TEXT,"
+    " model TEXT, model_served TEXT, is_stream INTEGER,"
+    " prompt_tokens INTEGER, completion_tokens INTEGER,"
+    " body_chars INTEGER, sha256 TEXT, messages_json TEXT,"
+    " response_text TEXT, tool_calls_json TEXT)")
+
+_RICH_INSERT = (
+    "INSERT INTO corpus (ts, user_id, api_key_label, model, model_served,"
+    " is_stream, prompt_tokens, completion_tokens, body_chars, sha256,"
+    " messages_json, response_text, tool_calls_json)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+
+_RICH_COLS = ("ts", "user_id", "api_key_label", "model", "model_served",
+              "is_stream", "prompt_tokens", "completion_tokens",
+              "body_chars", "sha256", "messages_json", "response_text",
+              "tool_calls_json")
+
+
+def _make_rich_db(path, rows):
+    conn = sqlite3.connect(path)
+    with conn:
+        conn.execute(_RICH_TABLE_DDL)
+        conn.executemany(_RICH_INSERT, rows)
+    conn.close()
+
+
+def _rich_row(i, **over):
+    row = {
+        "ts": "2026-10-14 20:31:00",
+        "user_id": "u%d" % i,
+        "api_key_label": "key-%d" % i,
+        "model": "GLM-5.3",
+        "model_served": "codely-core",
+        "is_stream": 1,
+        "prompt_tokens": 100 * i,
+        "completion_tokens": 10 * i,
+        "body_chars": 500,
+        "sha256": "h%d" % i,
+        "messages_json": json.dumps(
+            [{"role": "user", "content": "r%d" % i}]),
+        "response_text": "resp%d" % i,
+        "tool_calls_json": json.dumps([{"id": "t%d" % i}]),
+    }
+    row.update(over)
+    return tuple(row[k] for k in _RICH_COLS)
+
+
 # ─── 1. 正常导出 + 增量 ─────────────────────────────
 
 def test_export_basic_and_incremental(env):
@@ -463,3 +514,122 @@ def test_export_ack_export_no_duplicates(env):
     assert client.get(URL, query_string={"since_id": 0, "limit": 5000},
                       headers=_auth()).get_json() == {"lines": [],
                                                       "max_id": 0}
+
+
+# ─── 17. table_rich 形态（云端旧构建富列老表）────────
+
+def test_export_table_rich_mode(env):
+    _make_rich_db(env["base"] / "relay_corpus.db", [
+        _rich_row(1),
+        # 第二行：messages_json 故意坏 JSON、tool_calls 非 JSON、
+        # response_text NULL → 验证"解析失败原样 / NULL 给默认"
+        _rich_row(2, messages_json='{"broken": ', response_text=None,
+                  tool_calls_json="not-json"),
+    ])
+
+    d = client.get(URL, headers=_auth()).get_json()
+    assert d["max_id"] == 2
+    objs = [json.loads(x) for x in d["lines"]]
+    assert [o["id"] for o in objs] == [1, 2]
+
+    first = objs[0]
+    assert first["messages"] == [{"role": "user", "content": "r1"}]
+    assert first["tool_calls"] == [{"id": "t1"}]
+    assert first["response"] == "resp1"
+    assert first["ts"] == "2026-10-14 20:31:00"
+    assert first["model"] == "GLM-5.3"
+    assert first["model_served"] == "codely-core"
+    assert first["is_stream"] is True
+    assert first["prompt_tokens"] == 100
+    assert first["completion_tokens"] == 10
+    assert first["user_id"] == "u1"
+    assert first["api_key_label"] == "key-1"
+    assert first["sha256"] == "h1"
+
+    second = objs[1]
+    assert second["messages"] == '{"broken": '   # 坏 JSON 原样降级
+    assert second["tool_calls"] == "not-json"
+    assert second["response"] is None            # NULL 保持 null
+
+
+def test_export_table_rich_incremental(env):
+    _make_rich_db(env["base"] / "relay_corpus.db",
+                  [_rich_row(i) for i in (1, 2, 3)])
+
+    d1 = client.get(URL, query_string={"limit": 2},
+                    headers=_auth()).get_json()
+    assert [json.loads(x)["id"] for x in d1["lines"]] == [1, 2]
+    assert d1["max_id"] == 2
+
+    # 第二页只回更大 id（富列形态同样满足增量契约）
+    d2 = client.get(URL, query_string={"since_id": d1["max_id"]},
+                    headers=_auth()).get_json()
+    assert [json.loads(x)["id"] for x in d2["lines"]] == [3]
+    assert d2["max_id"] == 3
+
+    assert client.get(URL, query_string={"since_id": 3},
+                      headers=_auth()).get_json() == {"lines": [],
+                                                      "max_id": 0}
+
+
+def test_ack_table_rich_mode(env):
+    _make_rich_db(env["base"] / "relay_corpus.db",
+                  [_rich_row(i) for i in (1, 2, 3)])
+    d = client.get(URL, headers=_auth()).get_json()
+    assert [json.loads(x)["id"] for x in d["lines"]] == [1, 2, 3]
+
+    # ack 删远端 + 真实删除计数
+    r = client.get(ACK, query_string={"max_id": 2}, headers=_auth())
+    assert r.status_code == 200
+    assert r.get_json() == {"ok": True, "acked_upto": 2, "deleted": 2}
+    d2 = client.get(URL, headers=_auth()).get_json()
+    assert [json.loads(x)["id"] for x in d2["lines"]] == [3]
+
+    # 重复 ack 幂等（删 0 行仍 200，水位兜住）
+    r2 = client.get(ACK, query_string={"max_id": 2}, headers=_auth())
+    assert r2.status_code == 200
+    assert r2.get_json() == {"ok": True, "acked_upto": 2, "deleted": 0}
+
+    # 超过可导出上限 → 400
+    assert client.get(ACK, query_string={"max_id": 9},
+                      headers=_auth()).status_code == 400
+
+    # 追平：删最后一行
+    r3 = client.get(ACK, query_string={"max_id": 3}, headers=_auth())
+    assert r3.status_code == 200
+    assert r3.get_json() == {"ok": True, "acked_upto": 3, "deleted": 1}
+    assert client.get(URL, headers=_auth()).get_json() == {"lines": [],
+                                                          "max_id": 0}
+
+
+# ─── 18. 形态优先级 / 索引库独立文件 ────────────────
+
+def test_mode_priority_rich_over_index(env):
+    """同库同时能走 index（有 JSONL 语料）与 table_rich（富列表）
+    → 必须走 table_rich，且不创建独立索引库。"""
+    _write_jsonl(env["dir"] / "local_202610.jsonl",
+                 [_sample(1), _sample(2)])
+    _make_rich_db(env["base"] / "relay_corpus.db", [
+        _rich_row(7, messages_json=json.dumps(
+            [{"role": "user", "content": "rich"}]))])
+
+    d = client.get(URL, headers=_auth()).get_json()
+    # 只回富列表那 1 行（id 取库行 id=1），JSONL 的两行不参与
+    assert [json.loads(x)["id"] for x in d["lines"]] == [1]
+    assert json.loads(d["lines"][0])["messages"][0]["content"] == "rich"
+    assert not (env["base"] / "relay_corpus_index.db").exists()
+
+
+def test_index_db_separate_file(env):
+    """index 形态索引落 relay_corpus_index.db，不碰 relay_corpus.db。"""
+    _write_jsonl(env["dir"] / "local_202610.jsonl", [_sample(1)])
+
+    d = client.get(URL, headers=_auth()).get_json()
+    assert [json.loads(x)["id"] for x in d["lines"]] == [1]
+    assert (env["base"] / "relay_corpus_index.db").exists()
+    assert not (env["base"] / "relay_corpus.db").exists()
+
+    # 再请求一次仍稳定（索引复用独立库）
+    client.get(URL, headers=_auth())
+    assert not (env["base"] / "relay_corpus.db").exists()
+    assert (env["base"] / "relay_corpus_index.db").exists()

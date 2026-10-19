@@ -2256,10 +2256,15 @@ def api_corpus_stats():
 _TRAINING_EXPORT_DEFAULT_LIMIT = 5000
 _TRAINING_EXPORT_MAX_LIMIT = 5000
 _CORPUS_DB_NAME = "relay_corpus.db"
+# index 形态的索引库独立成文件（2026-10-20）：云端 relay_corpus.db 是
+# 旧构建留下的富列老表（table_rich 形态），索引若同文件会永远走不到
+# index 分支，且旧库的 WAL/只读偏好可能锁住建表。
+_CORPUS_INDEX_DB_NAME = "relay_corpus_index.db"
 
 # 语料索引表（本仓库的语料落盘形态是 JSONL 月度文件，语料库
-# 缺失/为空时按需自建；已有原生语料表则走 table 形态，见
-# _corpus_db_mode）：
+# 缺失/为空时按需自建；索引库是**独立文件** relay_corpus_index.db，
+# 与数据语料库 relay_corpus.db 分文件——见 _open_corpus_db；已有
+# 原生语料表（table_rich/table）则直读数据库，见 _corpus_db_mode）：
 # - corpus：一行 = 语料文件里的一条 JSON 行（file+off+len 定位，
 #   不复制内容——语料文件才是数据本体，避免双份存储占盘）；
 #   id 自增整数，导出时回填进该行 JSON 的 "id" 字段（拉取器按
@@ -2293,37 +2298,97 @@ CREATE TABLE IF NOT EXISTS corpus_files (
 
 
 def _training_export_paths():
-    """(语料文件目录, 语料库路径)。调用时解析 settings 常量，
-    不缓存——方案 §7.7 路径常量纪律（测试注入点）。"""
+    """(语料文件目录, 数据语料库, 索引库) 三元组。调用时解析
+    settings 常量，不缓存——方案 §7.7 路径常量纪律（测试注入点）。"""
     from proxy_core import settings as _settings
     base = _settings.BASE_DIR
     corpus_dir = getattr(_settings, "CORPUS_DIR", None)
     if corpus_dir is None:
         corpus_dir = os.path.join(str(base), "corpus_local")
-    return str(corpus_dir), os.path.join(str(base), _CORPUS_DB_NAME)
+    return (str(corpus_dir),
+            os.path.join(str(base), _CORPUS_DB_NAME),
+            os.path.join(str(base), _CORPUS_INDEX_DB_NAME))
+
+
+def _corpus_has_table(conn) -> bool:
+    """库里有 corpus 表？（空库/仅其它表 → False）"""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='corpus'").fetchone() is not None
 
 
 def _corpus_db_mode(conn):
-    """语料库形态判定（只看 corpus 表是否存在及其列）：
+    """语料库形态判定（只看 corpus 表是否存在及其列），优先级
+    table_rich > table > index：
 
-    - "table"：原生语料表（带 line 列——远端 relay 语料库形态，
-      直接读 line 原样导出）；
-    - "index"：无原生语料表（本仓库语料在 corpus_local/*.jsonl），
-      自建 file/off/len 索引；
+    - "table_rich"：富列老表（带 messages_json 列——云端旧构建
+      留下的 relay_corpus.db 形态，逐列打包成 JSON 行导出）；
+    - "table"：原生语料表（带 line 列——直接读 line 原样导出）；
+    - "index"：无 corpus 表（本仓库语料在 corpus_local/*.jsonl，
+      自建 file/off/len 索引）；旧版本索引恰好落在数据库文件里
+      的（存在 file/off/len 表）也归此类，就地续用；
     - None：corpus 表存在但结构不认识（调用方按 503 处理，
       绝不猜列名硬读）。
     """
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-        " AND name='corpus'").fetchone()
-    if not row:
+    if not _corpus_has_table(conn):
         return "index"
     cols = {r[1] for r in conn.execute("PRAGMA table_info(corpus)")}
+    if "messages_json" in cols:
+        return "table_rich"
     if "line" in cols:
         return "table"
     if {"file", "off", "len"} <= cols:
         return "index"
     return None
+
+
+def _open_corpus_db():
+    """打开语料存储 → (conn, mode, corpus_dir)。
+
+    数据库 relay_corpus.db 存在且带 corpus 表 → 按表形态直读/删行
+    （导出只读；ack 只 DELETE + 水位表，绝不改数据表 schema）；
+    否则走 index 形态的**独立索引库** relay_corpus_index.db。老版本
+    索引恰好建在数据库文件里的（file/off/len 表）继续用原文件，
+    避免存量索引失效。库损坏时抛 sqlite3.Error（调用方 503）。
+    """
+    corpus_dir, data_db, index_db = _training_export_paths()
+    if os.path.exists(data_db):
+        conn = sqlite3.connect(data_db, timeout=10.0)
+        if _corpus_has_table(conn):
+            return conn, _corpus_db_mode(conn), corpus_dir
+        conn.close()      # 空库/其它表：索引落独立文件，不往里写
+    return (sqlite3.connect(index_db, timeout=10.0), "index", corpus_dir)
+
+
+# 富列老表的导出列（顺序与 _export_rich_rows 解包一致）
+_RICH_COLUMNS_SQL = (
+    "SELECT id, ts, user_id, api_key_label, model, model_served,"
+    " is_stream, prompt_tokens, completion_tokens, body_chars, sha256,"
+    " messages_json, response_text, tool_calls_json FROM corpus")
+
+
+def _as_int(value) -> int:
+    """列值 → 整数（NULL/坏值回落 0）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_text(value) -> str:
+    """列值 → 字符串（NULL/坏值回落空串）。"""
+    return value if isinstance(value, str) else ""
+
+
+def _parse_embedded_json(value):
+    """富列里的 JSON 文本 → 对象；非字符串/解析失败一律原样返回
+    （坏数据不阻断整批导出，也不做二次脱敏——入库时已 redact）。"""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
 
 
 def _training_pull_auth():
@@ -2513,6 +2578,47 @@ def _export_table_rows(rows):
     return {"lines": lines, "max_id": max_id}
 
 
+def _export_rich_rows(rows):
+    """富列老表行 → lines（云端旧构建 relay_corpus.db 的 corpus 表）。
+
+    每行打包成统一 JSON 对象再序列化：
+      {"id", "ts", "model", "model_served", "is_stream", "prompt_tokens",
+       "completion_tokens", "user_id", "api_key_label", "sha256",
+       "messages", "response", "tool_calls"}
+    - "id" 恒为库行 id 整数（拉取器 int(id) 增量与 ack 直接满足）；
+    - "messages"/"tool_calls" 解析嵌入的 JSON 文本，解析失败原样
+      字符串下发（坏数据不阻断整批）；
+    - 列缺失/NULL 给合理默认（null/0/""）。
+    不做二次脱敏（入库时已 redact，与 table/index 形态同纪律）。
+    """
+    lines, max_id = [], 0
+    for (rid, ts, user_id, api_key_label, model, model_served,
+         is_stream, prompt_tokens, completion_tokens, _body_chars,
+         sha256, messages_json, response_text,
+         tool_calls_json) in rows:
+        if rid is None:
+            continue
+        obj = {
+            "id": _as_int(rid),
+            "ts": _as_text(ts),
+            "model": _as_text(model),
+            "model_served": _as_text(model_served),
+            "is_stream": bool(is_stream),
+            "prompt_tokens": _as_int(prompt_tokens),
+            "completion_tokens": _as_int(completion_tokens),
+            "user_id": _as_text(user_id),
+            "api_key_label": _as_text(api_key_label),
+            "sha256": _as_text(sha256),
+            "messages": _parse_embedded_json(messages_json),
+            "response": response_text if isinstance(response_text, str)
+            else None,
+            "tool_calls": _parse_embedded_json(tool_calls_json),
+        }
+        lines.append(json.dumps(obj, ensure_ascii=False))
+        max_id = _as_int(rid)
+    return {"lines": lines, "max_id": max_id}
+
+
 @bp.route("/training/export")
 def api_training_export():
     """语料导出（台式机 corpus_pull.py 每日增量拉取）。
@@ -2530,8 +2636,8 @@ def api_training_export():
     5000，钳制 1~5000）。
 
     index 形态下额外按已 ack 水位过滤（id > exported_upto）：拉取器
-    万一以 since_id=0 重跑也不会重复下发已确认的数据；table 形态
-    ack 直接删行，天然不重复。
+    万一以 since_id=0 重跑也不会重复下发已确认的数据；table /
+    table_rich 形态 ack 直接删行，天然不重复。
     """
     _, err = _training_pull_auth()
     if err is not None:
@@ -2554,33 +2660,36 @@ def api_training_export():
             return jsonify({"error": "limit 必须是整数"}), 400
     limit = max(1, min(limit, _TRAINING_EXPORT_MAX_LIMIT))
 
-    corpus_dir, db_path = _training_export_paths()
     try:
-        conn = sqlite3.connect(db_path, timeout=10.0)
+        conn, mode, corpus_dir = _open_corpus_db()
     except sqlite3.Error as e:
         log.error("[语料导出] 打开语料库失败: %s", e)
         return jsonify({"error": "corpus db unavailable: %s"
                                  % str(e)[:200]}), 503
     try:
-        mode = _corpus_db_mode(conn)
         if mode is None:
             return jsonify({"error": "corpus db schema unrecognized"}), 503
-        if mode == "index":
-            conn.executescript(_CORPUS_DB_SCHEMA)
-            _sync_corpus_index(conn, corpus_dir)
-            watermark = _corpus_watermark(conn)
+        if mode == "table_rich":
+            # 富列老表（云端旧构建）：逐列打包成 JSON 行；只读，不改 schema
             rows = conn.execute(
-                "SELECT id, file, off, len FROM corpus"
-                " WHERE id > ? AND id > ?"
-                " ORDER BY id LIMIT ?",
-                (since_id, watermark, limit)).fetchall()
-            return jsonify(_export_index_rows(corpus_dir, rows))
-        # table 形态：ack 删行，天然增量；只补建水位表供 ack 幂等校验
-        conn.executescript(_CORPUS_META_SCHEMA)
+                _RICH_COLUMNS_SQL + " WHERE id > ? ORDER BY id LIMIT ?",
+                (since_id, limit)).fetchall()
+            return jsonify(_export_rich_rows(rows))
+        if mode == "table":
+            rows = conn.execute(
+                "SELECT id, line FROM corpus WHERE id > ?"
+                " ORDER BY id LIMIT ?", (since_id, limit)).fetchall()
+            return jsonify(_export_table_rows(rows))
+        # index 形态（独立索引库 / 旧版就地索引）：增量扫描 + 水位过滤
+        conn.executescript(_CORPUS_DB_SCHEMA)
+        _sync_corpus_index(conn, corpus_dir)
+        watermark = _corpus_watermark(conn)
         rows = conn.execute(
-            "SELECT id, line FROM corpus WHERE id > ?"
-            " ORDER BY id LIMIT ?", (since_id, limit)).fetchall()
-        return jsonify(_export_table_rows(rows))
+            "SELECT id, file, off, len FROM corpus"
+            " WHERE id > ? AND id > ?"
+            " ORDER BY id LIMIT ?",
+            (since_id, watermark, limit)).fetchall()
+        return jsonify(_export_index_rows(corpus_dir, rows))
     except sqlite3.Error as e:
         # 库损坏/加锁超时等一律 503（不 500 裸崩）
         log.error("[语料导出] 语料库读写失败: %s", e)
@@ -2613,9 +2722,9 @@ def api_training_ack():
     - index 形态（本仓库）：**推进导出水位**（corpus_meta.
       exported_upto），不删索引行——保留审计/重放能力，导出侧
       `id > 水位` 过滤即天然不重复；
-    - table 形态（原生语料表）：按任务书原始语义
-      `DELETE FROM corpus WHERE id <= max_id`，同时记水位供幂等
-      重试校验。
+    - table / table_rich 形态（原生语料表 / 云端旧构建富列老表）：
+      按任务书原始语义 `DELETE FROM corpus WHERE id <= max_id`，
+      同时记水位供幂等重试校验。
     响应 {"ok": true, "acked_upto": N, "deleted": M}（200，幂等：
     重复 ack 同一水位 / 空库 ack max_id=0 均 200）。
     """
@@ -2626,15 +2735,13 @@ def api_training_ack():
     if err is not None:
         return err
 
-    corpus_dir, db_path = _training_export_paths()
     try:
-        conn = sqlite3.connect(db_path, timeout=10.0)
+        conn, mode, corpus_dir = _open_corpus_db()
     except sqlite3.Error as e:
         log.error("[语料确认] 打开语料库失败: %s", e)
         return jsonify({"error": "corpus db unavailable: %s"
                                  % str(e)[:200]}), 503
     try:
-        mode = _corpus_db_mode(conn)
         if mode is None:
             return jsonify({"error": "corpus db schema unrecognized"}), 503
         if mode == "index":
@@ -2660,7 +2767,8 @@ def api_training_ack():
             return jsonify({"ok": True, "acked_upto": watermark,
                             "deleted": 0})
 
-        # table 形态：删远端（任务书原始语义），水位仅用于幂等校验
+        # table / table_rich 形态：删远端（任务书原始语义），
+        # 水位表只在 ack 时补建（导出保持对老库只读）
         conn.executescript(_CORPUS_META_SCHEMA)
         cur_max = conn.execute(
             "SELECT MAX(id) FROM corpus").fetchone()[0] or 0
