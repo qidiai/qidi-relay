@@ -279,6 +279,14 @@ def send_chat(messages: list, model_id: str, timeout: float | None = None,
                 raise OpenCodeBridgeError(
                     "opencode bridge /message 返回 %d: %s"
                     % (msg_r.status_code, msg_r.text[:200]))
+            # 3) session clean (2026-10-19, zen-local-proxy style): bridge
+            # creates one session per request; never deleting them leaks
+            # sessions on the serve side (observed 50+). Best-effort.
+            try:
+                client.delete("%s/session/%s" % (base, session_id),
+                              headers=hdrs, timeout=10)
+            except Exception:
+                pass
     except httpx.HTTPError as e:
         # 连接失败/超时（含 ConnectionRefused）→ 可判负异常（不冷却）
         raise OpenCodeBridgeError("opencode bridge 不可达: %s" % e) from e
