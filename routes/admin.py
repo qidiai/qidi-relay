@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 import time
 
 import httpx
@@ -2248,6 +2249,451 @@ def api_corpus_stats():
     except Exception as e:
         log.error("语料统计生成失败: %s", e)
         return jsonify({"error": str(e)[:200]}), 500
+
+
+# ─── 语料导出（台式机 corpus_pull.py 每日增量拉取，pull_key 独立鉴权）─────
+
+_TRAINING_EXPORT_DEFAULT_LIMIT = 5000
+_TRAINING_EXPORT_MAX_LIMIT = 5000
+_CORPUS_DB_NAME = "relay_corpus.db"
+
+# 语料索引表（本仓库的语料落盘形态是 JSONL 月度文件，语料库
+# 缺失/为空时按需自建；已有原生语料表则走 table 形态，见
+# _corpus_db_mode）：
+# - corpus：一行 = 语料文件里的一条 JSON 行（file+off+len 定位，
+#   不复制内容——语料文件才是数据本体，避免双份存储占盘）；
+#   id 自增整数，导出时回填进该行 JSON 的 "id" 字段（拉取器按
+#   int(id) 做增量/ack）。
+# - corpus_files：每个文件已索引到的字节偏移（增量扫描，不重读
+#   历史文件）。
+# - corpus_meta：导出水位键值表（exported_upto = 拉取器已 ack 的
+#   最大 id）。ack 后不删索引行（保留审计/重放能力），靠水位过滤
+#   ——— table 形态则按任务书原始语义直接删行，水位仅作幂等校验。
+_CORPUS_META_SCHEMA = """
+CREATE TABLE IF NOT EXISTS corpus_meta (
+    key TEXT PRIMARY KEY,
+    val TEXT NOT NULL
+);
+"""
+
+_CORPUS_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS corpus (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file TEXT NOT NULL,
+    off INTEGER NOT NULL,
+    len INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    UNIQUE (file, off)
+);
+CREATE TABLE IF NOT EXISTS corpus_files (
+    file TEXT PRIMARY KEY,
+    off INTEGER NOT NULL DEFAULT 0
+);
+""" + _CORPUS_META_SCHEMA
+
+
+def _training_export_paths():
+    """(语料文件目录, 语料库路径)。调用时解析 settings 常量，
+    不缓存——方案 §7.7 路径常量纪律（测试注入点）。"""
+    from proxy_core import settings as _settings
+    base = _settings.BASE_DIR
+    corpus_dir = getattr(_settings, "CORPUS_DIR", None)
+    if corpus_dir is None:
+        corpus_dir = os.path.join(str(base), "corpus_local")
+    return str(corpus_dir), os.path.join(str(base), _CORPUS_DB_NAME)
+
+
+def _corpus_db_mode(conn):
+    """语料库形态判定（只看 corpus 表是否存在及其列）：
+
+    - "table"：原生语料表（带 line 列——远端 relay 语料库形态，
+      直接读 line 原样导出）；
+    - "index"：无原生语料表（本仓库语料在 corpus_local/*.jsonl），
+      自建 file/off/len 索引；
+    - None：corpus 表存在但结构不认识（调用方按 503 处理，
+      绝不猜列名硬读）。
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name='corpus'").fetchone()
+    if not row:
+        return "index"
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(corpus)")}
+    if "line" in cols:
+        return "table"
+    if {"file", "off", "len"} <= cols:
+        return "index"
+    return None
+
+
+def _training_pull_auth():
+    """语料拉取端点（export/ack）共用的 pull_key 鉴权。
+
+    返回 (pull_key, err)；err 为 None 表示通过，否则是可直接 return
+    的 Flask 响应元组。顺序语义：config 未启用/未配 key → 503（无
+    凭据可比对时不给 401/503 的探测差异）；Bearer 不匹配 → 401。
+    hmac.compare_digest 比字节（str 分支只支持 ASCII，非 ASCII key
+    会抛 TypeError → 500）。
+    """
+    from proxy_core import corpus as _corpus
+    cfg = _corpus._corpus_raw()
+    pull_key = cfg.get("pull_key")
+    if not isinstance(pull_key, str):
+        pull_key = ""
+    if not cfg.get("enabled") or not pull_key:
+        return "", (jsonify({
+            "error": "corpus export disabled: config.json "
+                     "corpus.enabled / corpus.pull_key 未配置"
+        }), 503)
+    auth = request.headers.get("Authorization", "") or ""
+    provided = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not provided or not hmac.compare_digest(
+            pull_key.encode("utf-8"), provided.encode("utf-8")):
+        return "", (jsonify({"error": "invalid pull key"}), 401)
+    return pull_key, None
+
+
+def _corpus_watermark(conn):
+    """已 ack 的导出水位（corpus_meta.exported_upto，缺省 0）。"""
+    try:
+        row = conn.execute(
+            "SELECT val FROM corpus_meta WHERE key='exported_upto'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    try:
+        return max(0, int(row[0])) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_corpus_watermark(conn, value: int) -> None:
+    """写导出水位（不提交——由调用方统一 commit）。"""
+    conn.execute(
+        "INSERT OR REPLACE INTO corpus_meta (key, val)"
+        " VALUES ('exported_upto', ?)", (str(int(value)),))
+
+
+def _ack_max_id_or_error():
+    """解析 ack 的 max_id：缺失/非整数/负数一律 400（拉取器恒传
+    正整数，负数说明客户端有错，静默当 0 会掩盖 bug）。"""
+    raw = request.args.get("max_id", "")
+    if raw == "":
+        return None, (jsonify({"error": "缺少 max_id 参数"}), 400)
+    try:
+        max_id = int(raw)
+    except (TypeError, ValueError):
+        return None, (jsonify({"error": "max_id 必须是整数"}), 400)
+    if max_id < 0:
+        return None, (jsonify({"error": "max_id 不能为负数"}), 400)
+    return max_id, None
+
+
+def _sync_corpus_index(conn, corpus_dir):
+    """把语料 JSONL 的新增行登记进索引（增量扫描：按
+    corpus_files.off 续读，不重读历史）。
+
+    只收本地采集线 local_YYYYMM.jsonl——corpus_YYYYMM.jsonl 是
+    拉取器落地的远端副本，导出它会形成自拉自环。尾部半行留待
+    下轮（worker 逐行 fsync 落盘，读到半行即写入未完成）。
+    """
+    try:
+        names = sorted(os.listdir(corpus_dir))
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith("local_") and name.endswith(".jsonl")):
+            continue
+        path = os.path.join(corpus_dir, name)
+        row = conn.execute(
+            "SELECT off FROM corpus_files WHERE file=?", (name,)).fetchone()
+        off = int(row[0]) if row else 0
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size < off:
+            # 文件被截断/重写（人工清理、月份文件重放）→ 该文件重扫
+            conn.execute("DELETE FROM corpus WHERE file=?", (name,))
+            off = 0
+        if size == off:
+            continue
+        inserted = 0
+        with open(path, "rb") as f:
+            f.seek(off)
+            pos = off
+            batch = []
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    break            # 尾部半行：下轮完整后再收
+                if line.strip():
+                    batch.append((name, pos, len(line)))
+                pos += len(line)
+                if len(batch) >= 500:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO corpus (file, off, len)"
+                        " VALUES (?, ?, ?)", batch)
+                    inserted += len(batch)
+                    batch = []
+            if batch:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO corpus (file, off, len)"
+                    " VALUES (?, ?, ?)", batch)
+                inserted += len(batch)
+            conn.execute(
+                "INSERT OR REPLACE INTO corpus_files (file, off)"
+                " VALUES (?, ?)", (name, pos))
+        conn.commit()
+        if inserted:
+            log.info("[语料导出] 索引新增 %d 行（%s）", inserted, name)
+
+
+def _export_index_rows(corpus_dir, rows):
+    """索引行 → lines（按 file+off+len 回读原 JSON 行，回填整数 id）。
+
+    文件被清理/行损坏 → 跳过该行（不阻断整批）；max_id 只随
+    成功导出的行推进（跳过行的 id 不会被误推进给拉取器）。
+    """
+    lines, max_id, handles = [], 0, {}
+    try:
+        for rid, name, off, length in rows:
+            fh = handles.get(name)
+            if fh is None:
+                try:
+                    fh = open(os.path.join(corpus_dir, name), "rb")
+                except OSError:
+                    continue
+                handles[name] = fh
+            fh.seek(off)
+            raw = fh.read(length)
+            if len(raw) != length:
+                continue                 # 文件被截断/清空
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue                 # 损坏行：跳过
+            if not isinstance(obj, dict):
+                continue
+            # 导出 id 恒为整数：拉取器 int(line["id"]) 做增量与 ack，
+            # 本地 id（local-YYYYMMDD-序号）不可直接给拉取器用。
+            obj["id"] = rid
+            lines.append(json.dumps(obj, ensure_ascii=False))
+            max_id = rid
+    finally:
+        for fh in handles.values():
+            fh.close()
+    return {"lines": lines, "max_id": max_id}
+
+
+def _export_table_rows(rows):
+    """原生语料表行 → lines（line 原样导出，不做二次脱敏——入库
+    时已脱敏）。
+
+    "id" 统一取库行 id（自增整数）：拉取器的增量与 ack 全靠
+    int(line["id"])，若行内 id 与库 id 不一致会漏拉/重拉；除 id
+    外内容逐字节原样。非 JSON 的坏行原样下发（不阻断整批）。
+    """
+    lines, max_id = [], 0
+    for rid, line in rows:
+        if not isinstance(line, str):
+            continue
+        out = line
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            obj["id"] = rid
+            out = json.dumps(obj, ensure_ascii=False)
+        lines.append(out)
+        max_id = rid
+    return {"lines": lines, "max_id": max_id}
+
+
+@bp.route("/training/export")
+def api_training_export():
+    """语料导出（台式机 corpus_pull.py 每日增量拉取）。
+
+    鉴权：Authorization: Bearer <config.corpus.pull_key>——与管理
+    会话完全独立（拉取器不是管理员，不走 check_admin_auth），
+    hmac.compare_digest 防时序侧信道。
+
+    响应 {"lines": ["<json行>", ...], "max_id": N}：
+    - lines 为库中语料行（入库时已脱敏，导出端不再脱敏），每行
+      JSON 必含整数 id——拉取器按它做增量与 ack；
+    - max_id = 本批最大 id（无数据 0），拉取器下次带
+      since_id=max_id 续拉。
+    参数：since_id（缺省 0，只回 id > since_id）、limit（缺省
+    5000，钳制 1~5000）。
+
+    index 形态下额外按已 ack 水位过滤（id > exported_upto）：拉取器
+    万一以 since_id=0 重跑也不会重复下发已确认的数据；table 形态
+    ack 直接删行，天然不重复。
+    """
+    _, err = _training_pull_auth()
+    if err is not None:
+        return err
+
+    raw_since = request.args.get("since_id", "") or "0"
+    try:
+        since_id = int(raw_since)
+    except (TypeError, ValueError):
+        return jsonify({"error": "since_id 必须是整数"}), 400
+    if since_id < 0:
+        since_id = 0
+    raw_limit = request.args.get("limit", "")
+    if raw_limit == "":
+        limit = _TRAINING_EXPORT_DEFAULT_LIMIT
+    else:
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit 必须是整数"}), 400
+    limit = max(1, min(limit, _TRAINING_EXPORT_MAX_LIMIT))
+
+    corpus_dir, db_path = _training_export_paths()
+    try:
+        conn = sqlite3.connect(db_path, timeout=10.0)
+    except sqlite3.Error as e:
+        log.error("[语料导出] 打开语料库失败: %s", e)
+        return jsonify({"error": "corpus db unavailable: %s"
+                                 % str(e)[:200]}), 503
+    try:
+        mode = _corpus_db_mode(conn)
+        if mode is None:
+            return jsonify({"error": "corpus db schema unrecognized"}), 503
+        if mode == "index":
+            conn.executescript(_CORPUS_DB_SCHEMA)
+            _sync_corpus_index(conn, corpus_dir)
+            watermark = _corpus_watermark(conn)
+            rows = conn.execute(
+                "SELECT id, file, off, len FROM corpus"
+                " WHERE id > ? AND id > ?"
+                " ORDER BY id LIMIT ?",
+                (since_id, watermark, limit)).fetchall()
+            return jsonify(_export_index_rows(corpus_dir, rows))
+        # table 形态：ack 删行，天然增量；只补建水位表供 ack 幂等校验
+        conn.executescript(_CORPUS_META_SCHEMA)
+        rows = conn.execute(
+            "SELECT id, line FROM corpus WHERE id > ?"
+            " ORDER BY id LIMIT ?", (since_id, limit)).fetchall()
+        return jsonify(_export_table_rows(rows))
+    except sqlite3.Error as e:
+        # 库损坏/加锁超时等一律 503（不 500 裸崩）
+        log.error("[语料导出] 语料库读写失败: %s", e)
+        return jsonify({"error": "corpus db unavailable: %s"
+                                 % str(e)[:200]}), 503
+    except OSError as e:
+        # 语料文件被删/权限变化等——同样 503（拉取器收到明确失败
+        # 会保留 since_id 重试，不会误 ack 丢数据）
+        log.error("[语料导出] 语料文件读取失败: %s", e)
+        return jsonify({"error": "corpus files unavailable: %s"
+                                 % str(e)[:200]}), 503
+    finally:
+        conn.close()
+
+
+@bp.route("/training/ack")
+def api_training_ack():
+    """语料拉取确认（corpus_pull.py 拉取并本地落盘成功后才调用）。
+
+    拉取器契约：ack 返回 200 = 远端确认这批数据可删，本地才写
+    since_id 水位（corpus_state.json）。所以本端点必须"先落库
+    再 200"——顺序反了会在失败时让拉取器误以为已 ack 而永久丢数据。
+
+    鉴权同 export（Bearer config.corpus.pull_key，不走
+    check_admin_auth）。参数 max_id：缺失/非整数/负数 → 400；
+    超过"当前可导出上限"（当前最大 id 与已 ack 水位的较大者）
+    → 400（防客户端 ack 未拉取过的水位造成静默丢数据）。
+
+    双形态：
+    - index 形态（本仓库）：**推进导出水位**（corpus_meta.
+      exported_upto），不删索引行——保留审计/重放能力，导出侧
+      `id > 水位` 过滤即天然不重复；
+    - table 形态（原生语料表）：按任务书原始语义
+      `DELETE FROM corpus WHERE id <= max_id`，同时记水位供幂等
+      重试校验。
+    响应 {"ok": true, "acked_upto": N, "deleted": M}（200，幂等：
+    重复 ack 同一水位 / 空库 ack max_id=0 均 200）。
+    """
+    _, err = _training_pull_auth()
+    if err is not None:
+        return err
+    max_id, err = _ack_max_id_or_error()
+    if err is not None:
+        return err
+
+    corpus_dir, db_path = _training_export_paths()
+    try:
+        conn = sqlite3.connect(db_path, timeout=10.0)
+    except sqlite3.Error as e:
+        log.error("[语料确认] 打开语料库失败: %s", e)
+        return jsonify({"error": "corpus db unavailable: %s"
+                                 % str(e)[:200]}), 503
+    try:
+        mode = _corpus_db_mode(conn)
+        if mode is None:
+            return jsonify({"error": "corpus db schema unrecognized"}), 503
+        if mode == "index":
+            conn.executescript(_CORPUS_DB_SCHEMA)
+            # 先同步索引，校验基数才是"当前真实可导出最大 id"
+            #（拉取器本就是 export→ack 顺序，这里是幂等的兜底）
+            _sync_corpus_index(conn, corpus_dir)
+            cur_max = conn.execute(
+                "SELECT MAX(id) FROM corpus").fetchone()[0] or 0
+            watermark = _corpus_watermark(conn)
+            exportable = max(int(cur_max), watermark)
+            if max_id > exportable:
+                return jsonify({
+                    "error": "max_id 超过可导出上限（未导出过的水位"
+                             "不可 ack）",
+                    "exportable_max": exportable}), 400
+            if max_id > watermark:
+                _set_corpus_watermark(conn, max_id)
+                watermark = max_id
+            conn.commit()        # 先落库，再 200
+            log.info("[语料确认] 导出水位推进到 %d（index 形态，"
+                     "保留索引行供审计）", watermark)
+            return jsonify({"ok": True, "acked_upto": watermark,
+                            "deleted": 0})
+
+        # table 形态：删远端（任务书原始语义），水位仅用于幂等校验
+        conn.executescript(_CORPUS_META_SCHEMA)
+        cur_max = conn.execute(
+            "SELECT MAX(id) FROM corpus").fetchone()[0] or 0
+        watermark = _corpus_watermark(conn)
+        exportable = max(int(cur_max), watermark)
+        if max_id > exportable:
+            return jsonify({
+                "error": "max_id 超过可导出上限（未导出过的水位"
+                         "不可 ack）",
+                "exportable_max": exportable}), 400
+        cur = conn.execute("DELETE FROM corpus WHERE id <= ?", (max_id,))
+        deleted = cur.rowcount if isinstance(cur.rowcount, int) else 0
+        if deleted < 0:
+            deleted = 0
+        if max_id > watermark:
+            _set_corpus_watermark(conn, max_id)
+            watermark = max_id
+        conn.commit()            # 删除/水位先落盘，再 200
+        log.info("[语料确认] 已删除 %d 行（≤ id %d），水位 %d",
+                 deleted, max_id, watermark)
+        return jsonify({"ok": True, "acked_upto": watermark,
+                        "deleted": deleted})
+    except sqlite3.Error as e:
+        # 库损坏/加锁超时等一律 503（不 500 裸崩）
+        log.error("[语料确认] 语料库读写失败: %s", e)
+        return jsonify({"error": "corpus db unavailable: %s"
+                                 % str(e)[:200]}), 503
+    except OSError as e:
+        log.error("[语料确认] 语料文件访问失败: %s", e)
+        return jsonify({"error": "corpus files unavailable: %s"
+                                 % str(e)[:200]}), 503
+    finally:
+        conn.close()
 
 
 # 注水检测模型清单缓存：上游 /v1/models 拉一次用 10 分钟，避免管理面板轮询打上游
