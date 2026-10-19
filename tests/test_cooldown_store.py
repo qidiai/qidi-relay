@@ -42,9 +42,17 @@ def _reset_store():
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    """COOLDOWNS_FILE 注入本用例专属 TMP 文件（用例后还原）。"""
+    """COOLDOWNS_FILE + CONFIG_FILE 均注入本用例专属 TMP（用例后还原）。
+
+    审计 I-8：`_enabled()` 走 settings.CONFIG_FILE，若指向仓库真实配置，
+    测试结果就随机器上的 cooldown.persist 漂移。这里显式给出
+    persist=true，让持久化语义在测试内确定。
+    """
     path = tmp_path / "cooldowns.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"cooldown": {"persist": True}}), encoding="utf-8")
     monkeypatch.setattr(S, "COOLDOWNS_FILE", path)
+    monkeypatch.setattr(S, "CONFIG_FILE", cfg)
     _reset_store()
     yield path
     _reset_store()
@@ -188,6 +196,54 @@ def test_persist_false_no_read_no_write(env, monkeypatch):
     assert env.read_text(encoding="utf-8") == before
 
 
+def test_sweep_skips_disk_when_persist_disabled(env, monkeypatch):
+    """审计 I-2：sweep 必须尊重 persist=false（dirty 已置位也不落盘）。"""
+    CS.set_provider("p", time.time() + 900)
+    assert CS.persist() is True                    # 先留下基线文件
+    baseline = env.read_text(encoding="utf-8")
+
+    cfg = env.parent / "config.json"
+    cfg.write_text(json.dumps({"cooldown": {"persist": False}}), encoding="utf-8")
+    monkeypatch.setattr(S, "CONFIG_FILE", cfg)
+
+    CS._DIRTY = True                               # 模拟"关闭前已置脏"
+    CS._sweep_once()                               # persist=false：不得落盘
+    assert CS._DIRTY is True                       # 且不清 dirty（既有语义）
+    assert env.read_text(encoding="utf-8") == baseline
+
+    env.unlink()                                   # 关闭期绝不（重）建文件
+    CS._sweep_once()
+    assert not env.exists()
+    assert CS._DIRTY is True
+
+
+# ─── 5b. persist 值防御式解析（审计 S-1）───────────────────────────
+
+@pytest.mark.parametrize("value,expected", [
+    ("false", False), ("FALSE", False), (" 0 ", False), ("no", False), ("off", False),
+    ("true", True), ("True", True), (" 1 ", True), ("yes", True), ("on", True),
+    (1, True), (0, False), (1.0, True), (0.0, False),
+    (None, True),                                 # 显式 null = 未配置 → 默认 true
+])
+def test_persist_flag_defensive_parse(env, monkeypatch, value, expected):
+    """字符串 "false"/"0"/"no" 不得被裸 bool() 判真。"""
+    cfg = env.parent / "config.json"
+    cfg.write_text(json.dumps({"cooldown": {"persist": value}}), encoding="utf-8")
+    monkeypatch.setattr(S, "CONFIG_FILE", cfg)
+    assert CS._enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["bogus", 2, 2.5, [], {}])
+def test_persist_flag_invalid_warns_and_defaults_true(env, monkeypatch, caplog, value):
+    cfg = env.parent / "config.json"
+    cfg.write_text(json.dumps({"cooldown": {"persist": value}}), encoding="utf-8")
+    monkeypatch.setattr(S, "CONFIG_FILE", cfg)
+    with caplog.at_level(logging.WARNING, logger="qidi-relay"):
+        assert CS._enabled() is True
+    assert any("cooldown.persist 配置值非法" in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+
 # ─── 6. channels 节：cline 冷却恢复 ─────────────────────────────────
 
 def test_channel_cooldown_restored_on_reload(env, tmp_path):
@@ -205,7 +261,8 @@ def test_channel_cooldown_restored_on_reload(env, tmp_path):
 
     ch.set_cooldown(3600, "日配额耗尽")
     recorded = ch.cooldown_until
-    assert CS.get_channel("clp", "主号") == pytest.approx(recorded)
+    # 键按 auth 路径（稳定），label 不再是键的一部分
+    assert CS.get_channel("clp", "主号", auth_path=str(auth)) == pytest.approx(recorded)
 
     # 重建（config mtime 变化 / 重启）：冷却回灌到新实例
     cline.reload_channels_from_config(cfg)
@@ -216,6 +273,73 @@ def test_channel_cooldown_restored_on_reload(env, tmp_path):
 
     # 清理全局通道注册表，避免污染后续用例
     cline._channels.clear()
+
+
+# ─── 6b. 稳定通道键：重启 + label 变化 / 账号顺序变化（审计 I-1）───
+
+def test_channel_key_stable_across_restart_label_and_order(env, tmp_path):
+    """模拟重启：配置账号顺序颠倒、label 全部去掉（自动拼装 label 变了），
+    冷却仍按同一 auth 路径恢复；未被冷却的账号不被误挂。"""
+    a = tmp_path / "a.json"
+    b = tmp_path / "b.json"
+    a.write_text("{}", encoding="utf-8")
+    b.write_text("{}", encoding="utf-8")
+
+    def _cfg(entries):
+        return {"providers": {"clp": {"type": "cline", "models": ["cl-model"],
+                                      "auth_paths": entries}}}
+
+    cline.reload_channels_from_config(_cfg([
+        {"path": str(a), "label": "主号"},
+        {"path": str(b), "label": "备用"},
+    ]))
+    ch_a = next(c for c in cline.channels_for("clp") if c.auth_path == str(a))
+    ch_a.set_cooldown(6 * 3600, "日配额耗尽")
+    recorded = ch_a.cooldown_until
+    assert CS.persist() is True
+    keys = json.loads(env.read_text(encoding="utf-8"))["channels"]
+    assert list(keys) and all(k.startswith("clp|path:") for k in keys), keys
+
+    # 重启形态：内存全清 + 配置顺序颠倒且不带 label（自动 label 与旧值不同）
+    _reset_store()
+    cline._channels.clear()
+    cline.reload_channels_from_config(_cfg([
+        {"path": str(b)},
+        {"path": str(a)},
+    ]))
+    chs = cline.channels_for("clp")
+    new_a = next(c for c in chs if c.auth_path == str(a))
+    new_b = next(c for c in chs if c.auth_path == str(b))
+    assert new_a.label != "主号"              # label 已漂移（自动拼装）
+    assert new_a.cooldown_until == pytest.approx(recorded)   # 仍按路径恢复
+    assert new_b.cooldown_until == 0.0        # 另一账号不受牵连
+    cline._channels.clear()
+
+
+def test_minicode_channel_key_stable_across_restart_label_change(env, tmp_path):
+    """minicode 同款：label 改名后仍按 auth 路径恢复冷却。"""
+    import proxy_core.minicode as mc
+
+    a = tmp_path / "mc_auth.json"
+    a.write_text("{}", encoding="utf-8")
+
+    def _cfg(entry):
+        return {"providers": {"mcp": {"type": "minicode",
+                                      "auth_paths": [entry]}}}
+
+    mc.reload_channels_from_config(_cfg({"path": str(a), "label": "旧标签"}))
+    ch = mc.channels_for("mcp")[0]
+    ch.set_cooldown(6 * 3600, "429 日配额")
+    recorded = ch.cooldown_until
+    assert CS.persist() is True
+
+    _reset_store()
+    mc._channels.clear()
+    mc.reload_channels_from_config(_cfg({"path": str(a)}))   # 无 label → 自动拼装
+    ch2 = mc.channels_for("mcp")[0]
+    assert ch2.label != "旧标签"
+    assert ch2.cooldown_until == pytest.approx(recorded)
+    mc._channels.clear()
 
 
 # ─── 7. 路径隔离 ────────────────────────────────────────────────────

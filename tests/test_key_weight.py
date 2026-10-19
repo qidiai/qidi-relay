@@ -171,6 +171,32 @@ def test_accounts_weight_not_used_by_get_next(tmp_path, monkeypatch):
     assert next(a for a in mgr.accounts if a["user_id"] == "u4")["weight"] == 1
 
 
+def test_get_next_model_none_skips_model_accounts(tmp_path, monkeypatch):
+    """回归（1019 定向绑定）：model=None 不得进 model_accounts 查表。
+
+    曾因 `ma.get(model.lower())` 对 None 调 .lower() 抛 AttributeError；
+    空 model 应跳过定向绑定、保持全池轮转；有 model 时定向绑定照旧生效。
+    """
+    import proxy_core.settings as S
+
+    acc_file = tmp_path / "accounts.json"
+    acc_file.write_text(json.dumps({"accounts": [
+        {"user_id": "u1", "access_token": "t"},
+        {"user_id": "u2", "access_token": "t"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(A, "ACCOUNTS_FILE", acc_file)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"model_accounts": {"GLM-5.3": ["u1"]}}),
+                   encoding="utf-8")
+    monkeypatch.setattr(S, "CONFIG_FILE", cfg)
+
+    mgr = A.AccountManager()
+    mgr.index = 0
+    assert {mgr.get_next()["user_id"] for _ in range(2)} == {"u1", "u2"}
+    # 语义不变：显式 model 命中定向绑定时仍收窄到指定账号
+    assert mgr.get_next(model="GLM-5.3")["user_id"] == "u1"
+
+
 # ─── 5. _parse_keys 白名单透传单测 ──────────────────────────────────
 
 def test_parse_keys_weight_whitelist():

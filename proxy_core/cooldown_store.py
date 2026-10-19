@@ -12,7 +12,11 @@
 
     {"version": 1, "saved_at": <ts>,
      "providers": {name: until_ts},
-     "channels":  {"prov|label": until_ts}}
+     "channels":  {"prov|path:<auth 路径>": until_ts}}
+
+channels 键用 **auth 路径**派生（稳定标识）：relay 重启 / 账号顺序
+变化 / label 改名都不会让键漂移；无 auth 路径的通道回退
+"prov|label"（占位通道，无跨重启恢复语义）。
 
 设计纪律（与 affinity.py 同款，规格 §R-A 逐条）：
 - 路径常量走 settings.COOLDOWNS_FILE（可注入；§7.7 纪律——
@@ -41,7 +45,7 @@ log = logging.getLogger("qidi-relay")
 _VERSION = 1
 _SWEEP_S = 2.0   # 后台扫尾间隔（≤2s，affinity 同款）
 
-# 内存表：name -> until_ts / "prov|label" -> until_ts
+# 内存表：name -> until_ts / 通道键 -> until_ts
 _providers: dict = {}
 _channels: dict = {}
 _LOCK = threading.RLock()
@@ -50,6 +54,10 @@ _LOADED = False         # 首次访问已做懒加载
 _WORKER_STARTED = False
 _WORKER_LOCK = threading.Lock()
 
+# persist 配置的防御式布尔词表（字符串 "false" 不得被 bool() 判真）
+_TRUE_WORDS = frozenset(("true", "1", "yes", "on"))
+_FALSE_WORDS = frozenset(("false", "0", "no", "off"))
+
 
 def _cooldowns_file():
     """路径常量走 settings（可注入）：每次取现，测试改
@@ -57,17 +65,46 @@ def _cooldowns_file():
     return settings.COOLDOWNS_FILE
 
 
+def _parse_bool(value, default: bool = True) -> bool:
+    """防御式布尔解析（与 settings.get_keepalive_seconds 同纪律）。
+
+    bool → 原值；数字 1/0（含 1.0/0.0）→ True/False；
+    字符串 true/1/yes/on、false/0/no/off（大小写/首尾空白不敏感）
+    → 对应布尔；None = 未配置 → 静默回默认；其余非法值 →
+    warning 日志 + 默认（配置坏了不改变既有默认行为）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    elif isinstance(value, str):
+        s = value.strip().lower()
+        if s in _TRUE_WORDS:
+            return True
+        if s in _FALSE_WORDS:
+            return False
+    elif value is None:
+        return default
+    log.warning("cooldown.persist 配置值非法（%r），按默认 %s", value, default)
+    return default
+
+
 def _enabled() -> bool:
     """config cooldown.persist（默认 true）。
     false → 不读不写（每次请求读 config，与 affinity 的
-    features 检查同款；改 config 免重启即生效）。"""
+    features 检查同款；改 config 免重启即生效）。
+    值解析走 `_parse_bool`：字符串 "false"/"0"/"no" 等按 false 处理
+    （裸 bool() 会把非空字符串一律判真，经典配置坑）。"""
     try:
         cfg = load_config()
     except Exception:
         return True   # 配置读失败按默认 true（宁持久化不丢）
     cooldown = cfg.get("cooldown") if isinstance(cfg, dict) else None
     if isinstance(cooldown, dict):
-        return bool(cooldown.get("persist", True))
+        return _parse_bool(cooldown.get("persist"), default=True)
     return True
 
 
@@ -111,42 +148,71 @@ def clear_provider(name: str) -> None:
 
 # ── channels 节（cline / minicode 通道级冷却）─────────────
 
-def _ckey(name: str, label: str) -> str:
+def _norm_auth_path(auth_path: str) -> str:
+    """auth 路径规范化（大小写/分隔符/冗余段不敏感——Windows 下同一
+    文件的不同写法归一到同一键）。保持相对路径相对形态（不解析
+    CWD），同一 config 文本跨重启恒得同一结果。"""
+    s = str(auth_path or "").strip()
+    if not s:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(s))
+    except (TypeError, ValueError):   # pragma: no cover - 兜底
+        return s
+
+
+def _ckey(name: str, label: str, auth_path: str | None = None) -> str:
+    """通道持久化键。
+
+    优先 **auth 路径**（`prov|path:<规范化路径>`）：路径是通道的天然
+    唯一稳定标识，relay 重启 / 配置里账号顺序变化 / 自动拼装的
+    label 变化都不会让键漂移——这是"重启后冷却仍能恢复"的前提。
+    无 auth 路径（占位通道 / 旧调用）时回退 `prov|label`。
+    """
+    p = _norm_auth_path(auth_path) if auth_path else ""
+    if p:
+        return f"{name}|path:{p}"
     return f"{name}|{label}"
 
 
-def get_channel(name: str, label: str):
-    """返回通道的有效冷却截止时间戳；无 / 已过期返回 None。"""
+def get_channel(name: str, label: str, auth_path: str | None = None):
+    """返回通道的有效冷却截止时间戳；无 / 已过期返回 None。
+
+    auth_path 给出时按稳定路径键查（cline/minicode 通道都传
+    自身 auth_path）；不给则按旧 `prov|label` 键查。"""
     if not _enabled():
         return None
     with _LOCK:
         _ensure_loaded_locked()
-        ts = _channels.get(_ckey(name, label))
+        ts = _channels.get(_ckey(name, label, auth_path))
     if ts and ts > time.time():
         return ts
     return None
 
 
-def set_channel(name: str, label: str, until_ts: float) -> None:
-    """记录通道冷却（内存 + dirty，后台线程落盘）。"""
+def set_channel(name: str, label: str, until_ts: float,
+                auth_path: str | None = None) -> None:
+    """记录通道冷却（内存 + dirty，后台线程落盘）。
+
+    auth_path 给出时写稳定路径键（见 `_ckey`），保证跨重启可恢复。"""
     if not _enabled():
         return
     global _DIRTY
     with _LOCK:
         _ensure_loaded_locked()
-        _channels[_ckey(name, label)] = until_ts
+        _channels[_ckey(name, label, auth_path)] = until_ts
         _DIRTY = True
     _ensure_worker()
 
 
-def clear_channel(name: str, label: str) -> None:
+def clear_channel(name: str, label: str, auth_path: str | None = None) -> None:
     """解除通道冷却（内存 + dirty；落盘后重启不复活）。"""
     if not _enabled():
         return
     global _DIRTY
     with _LOCK:
         _ensure_loaded_locked()
-        if _channels.pop(_ckey(name, label), None) is not None:
+        if _channels.pop(_ckey(name, label, auth_path), None) is not None:
             _DIRTY = True
     _ensure_worker()
 
@@ -265,8 +331,15 @@ def _save_to_disk() -> bool:
 
 def _sweep_once() -> None:
     """一轮扫尾：脏则原子落盘。**失败保留 dirty 不清**（下轮重试，
-    R-004 可见），与 affinity._worker 的"失败也清 dirty"不同。"""
+    R-004 可见），与 affinity._worker 的"失败也清 dirty"不同。
+
+    persist=false 契约是"不读不写"：即使关闭前已置脏（运行中改
+    config），扫尾也不得落盘；**且不清 dirty**（关闭不清脏的既有
+    语义保持——重新开启 persist 后仍会把关闭前的状态写出去）。
+    """
     global _DIRTY
+    if not _enabled():
+        return
     try:
         with _LOCK:
             if _DIRTY and _save_to_disk():

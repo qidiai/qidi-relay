@@ -310,8 +310,9 @@ class MiniCodeChannel:
     def set_cooldown(self, seconds: float, note: str = ""):
         self.cooldown_until = time.time() + max(1, seconds)
         self.cooldown_note = str(note or "")[:120]
-        # R-A：通道级冷却持久化（重载/重启后按 prov|label 回灌）
-        cooldown_store.set_channel(self.name, self.label, self.cooldown_until)
+        # R-A：通道级冷却持久化（键= auth 路径，跨重启稳定）
+        cooldown_store.set_channel(self.name, self.label, self.cooldown_until,
+                                   auth_path=self.auth_path)
 
     def invalidate(self):
         """401 等凭证失效：丢弃内存缓存强制重读（官方客户端/刷新后可再试）。"""
@@ -429,13 +430,15 @@ def reload_channels_from_config(cfg: dict) -> None:
 
 
 def _restore_cooldowns(new: dict) -> None:
-    """R-A：通道实例重建后按 prov|label 回灌持久化冷却（晚于实例
-    构造、早于首个请求）。label 不稳定（重命名/删除）的键过期自然
-    失效，不跨实例错挂；恢复失败仅 warning 不阻断重载。"""
+    """R-A：通道实例重建后按稳定键（auth 路径）回灌持久化冷却（晚于
+    实例构造、早于首个请求）。label 不参与键——账号顺序变化 / 自动
+    拼装 label 变化不会让冷却状态失配；无 auth 路径的占位通道回退
+    `prov|label` 键；恢复失败仅 warning 不阻断重载。"""
     for name, chs in new.items():
         for ch in chs:
             try:
-                until = cooldown_store.get_channel(name, ch.label)
+                until = cooldown_store.get_channel(name, ch.label,
+                                                   auth_path=ch.auth_path)
             except Exception as e:
                 log.warning("[minicode] 冷却恢复失败 %s|%s: %s", name, ch.label, e)
                 continue

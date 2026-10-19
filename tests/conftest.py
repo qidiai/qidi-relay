@@ -9,6 +9,7 @@
 都有处可去（双实例纪律：tmp 名带 pid，互不共写）。
 """
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -27,6 +28,29 @@ import proxy_core.settings as S
 _S_TMP = pathlib.Path(tempfile.mkdtemp(prefix="qidi-affinity-conftest-"))
 S.CONVERSATIONS_FILE = _S_TMP / "conversations.json"
 S.COOLDOWNS_FILE = _S_TMP / "cooldowns.json"   # 冷却状态持久化（吸收-1 §R-A）
+
+# 隔离配置（审计 I-8）：仓库真实 config.json 不参与测试。cooldown.persist
+# 等语义必须由测试自己确定，否则结果随机器配置漂移（真实关掉持久化时
+# 相关用例会莫名失败）。显式写 persist=true 作为默认测试语义。
+_REPO_CONFIG_FILE = S.CONFIG_FILE
+_CFG_TMP = _S_TMP / "config.json"
+_CFG_TMP.write_text(json.dumps({"cooldown": {"persist": True}}),
+                    encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_file(monkeypatch):
+    """配置隔离兜底（审计 I-8）：不读仓库真实 config.json。
+
+    绝大多数测试文件在自己的 preamble 里已把 `settings.CONFIG_FILE`
+    重定向到用例专属 TMP（方案 §7.7 模式）——此时**尊重该重定向**，
+    本 fixture 不覆盖；只有当它仍指向仓库真实 config.json 时，才切到
+    隔离配置（{"cooldown": {"persist": true}}）。这样 cooldown 持久化
+    等配置语义在测试内确定，不随机器真实配置（persist=false）漂移。
+    """
+    if S.CONFIG_FILE == _REPO_CONFIG_FILE:
+        monkeypatch.setattr(S, "CONFIG_FILE", _CFG_TMP)
+    yield
 
 
 @pytest.fixture(autouse=True)

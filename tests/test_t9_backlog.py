@@ -496,10 +496,10 @@ def test_peek_bad_registers_and_finishes_gate_no_residual(monkeypatch):
     peek_regs = [x for x in regs if x[2] in ("9001", "9002", "9003")]
     assert len(peek_regs) == 3
     assert all(x[3] is True for x in peek_regs)
-    # 登记的 model 是守卫改写后的模型：请求 GLM-5.3 被
-    # 模型守卫无条件改写为 codely-core（proxy.py:1243-1247，
-    # 上游收回直连权限）——peek 登记发生在改写之后
-    assert all(x[1] == "codely-core" for x in peek_regs)
+    # 登记的 model 与守卫放行后的模型一致：GLM-5.3 在池白名单内，
+    # 1019 已撤销"GLM-5.3→codely-core"改写（codely-core 后端换成
+    # DeepSeek，保留改写会错路由），故登记为原名 GLM-5.3
+    assert all(x[1] == "GLM-5.3" for x in peek_regs)
     # 判负 rid 全部以 "gate" 终结
     gate_fins = {rid for rid, st in fins if st == "gate"}
     assert {x[0] for x in peek_regs} <= gate_fins

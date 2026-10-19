@@ -262,7 +262,10 @@ class AccountManager:
         # {模型: [user_id, ...]}，命中则收窄候选；指定账号全不可用
         # 时如实 503（无权限账号打上去也是 404，回退没有意义）。
         ma = (load_config().get("model_accounts") or {})
-        allow = ma.get(model) or ma.get(model.lower())
+        # model 可为 None（内部无模型上下文的选号调用，如预热/健康检查）：
+        # 此时跳过定向绑定走原轮转逻辑，不得对 None 调 .lower()
+        # （1019 回归：曾抛 AttributeError）。
+        allow = ma.get(model) or (ma.get(model.lower()) if model else None)
         if allow:
             narrowed = [a for a in enabled if a["user_id"] in allow]
             if narrowed:
