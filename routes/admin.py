@@ -1503,9 +1503,49 @@ def api_provider_models_upstream(name):
     if not isinstance(p, dict):
         return jsonify({"ok": False,
                         "error": f"provider「{name}」不存在"}), 404
-    if p.get("type"):
+    ptype = str(p.get("type") or "")
+    if ptype:
+        # 特殊渠道的上游列表拉取（2026-10-20）：免费阵容轮换后一键可见。
+        # cline：上游 api.cline.bot/api/v1 是 OpenAI 兼容协议，用渠道
+        #   OAuth token + 指纹头拉 /models（实测 470 个模型全量返回）。
+        if ptype == "cline":
+            import uuid as _uuid
+            from proxy_core import cline as _cline
+            try:
+                _cline.reload_channels_from_config(load_config())
+                chs = _cline.channels_for(name)
+                if not chs:
+                    return jsonify({"ok": False,
+                                    "error": "无可用 cline 通道（auth_paths 未配置）"})
+                last = ""
+                for ch in chs:
+                    try:
+                        token = ch.get_token()
+                        hdrs = ch.request_headers(
+                            token, "probe-" + _uuid.uuid4().hex[:12])
+                        with httpx.Client(timeout=15, trust_env=False) as c:
+                            r = c.get(_cline.API_BASE + "/models",
+                                      headers=hdrs)
+                        if r.status_code == 200:
+                            models = [m.get("id")
+                                      for m in (r.json().get("data") or [])
+                                      if isinstance(m, dict) and m.get("id")]
+                            return jsonify({"ok": True, "models": models})
+                        last = "HTTP %s %s" % (r.status_code, r.text[:60])
+                    except Exception as e:
+                        last = str(e)[:80]
+                return jsonify({"ok": False,
+                                "error": "cline 上游列表拉取失败: %s" % last})
+            except Exception as e:
+                return jsonify({"ok": False,
+                                "error": "cline 刷新异常: %s" % str(e)[:80]})
+        # opencode-serve：桥（opencode serve）的 /v1/models 是 Web UI
+        # fallthrough，无列表端点；账号可用集由上游逐模型鉴权决定，
+        # 无简单列表可拉。minicode：Anthropic 风格 mavis 网关，同样无
+        # OpenAI /models。atomcode：签名协议。均保持明确拒绝。
         return jsonify({"ok": False,
-                        "error": "该渠道类型不支持列表刷新"})
+                        "error": "渠道类型 %s 无 OpenAI 兼容上游列表，"
+                                 "请手动维护 models" % ptype})
     base_url = str(p.get("base_url") or "").rstrip("/")
     if not base_url:
         return jsonify({"ok": False,

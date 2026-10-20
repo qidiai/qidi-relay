@@ -861,7 +861,11 @@ function renderProviderCard(p, _idx, all) {
   // /api/providers/info 不透出 type，故 type 由 ensureProviderTypes 从
   // /api/config 补齐（按渠道名集合指纹缓存，避免频繁拉全量配置）。
   const providerType = p.type || providerTypesCache[p.name] || "";
-  const specialChannel = !!(providerType || p.atomcode || p.cline || p.minicode);
+  // 2026-10-20：cline 上游是 OpenAI 兼容协议，后端已支持用渠道 token
+  // + 指纹头拉 /models——按钮渲染；其余 type 渠道保持隐藏。
+  const NO_REFRESH_TYPES = ["atomcode", "minicode", "opencode-serve"];
+  const specialChannel = !!((providerType &&
+      NO_REFRESH_TYPES.indexOf(providerType) >= 0) || p.atomcode || p.minicode);
   return `
   <div class="acc-card ${p.ok && p.enabled !== false ? "" : "disabled"}">
     <div class="acc-top">
