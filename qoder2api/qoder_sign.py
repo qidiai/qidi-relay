@@ -598,6 +598,13 @@ class CosySession(object):
         """构造一次推理/模型接口的完整 COSY 签名头。"""
         _, date, bearer = self.bearer(body, raw_url)
         h = {
+            # 2026-10-20 对照 magpie/internal/qoder/cosy.go 补齐官方客户端
+            # 恒定头（两边 RSA 公钥与签名公式完全一致，协议互证；这 4 个
+            # 是桥原先缺失的，补全后请求头与官方客户端同构）
+            "cosy-business-product": "app",
+            "cosy-business-type": "agent",
+            "cosy-scene": "app",
+            "cosy-machineos": "x86_64",
             "cosy-data-policy": "AGREE",
             "content-type": "application/json",
             "cosy-machinetype": self.machine_type,
