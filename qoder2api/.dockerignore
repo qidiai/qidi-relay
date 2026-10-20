@@ -1,0 +1,22 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+python/
+*.bat
+*.zip
+*.bak*
+temp_*
+_acc
+_use
+.DS_Store
+
+# Team workspace / runtime state (never ship)
+.team/
+accounts/
+usage/
+.mimosa/
+_shots/
+umid/

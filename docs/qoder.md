@@ -7,7 +7,9 @@
          （qoder2api-hub v1.5.4，COSY 签名真协议）→ gateway.qoder.com.cn
 ```
 
-- **桥**：`G:\程序开发\qoder2api-audit`（MIT，零依赖，Python 3.9+）
+- **桥**：`qoder2api/`（本仓 vendored 的 qoder2api-hub v1.5.4，MIT，
+  零依赖，Python 3.9+；上游 github.com/shuishuipingan/qoder2api-hub，
+  归属与快速开始见 qoder2api/VENDORED.md）
   - 启动：计划任务 `qoder2api`（开机自启，`run-qoder-proxy.vbs` wscript  detached）
   - 端口 8790（`/v1` OpenAI 兼容 + `/` 面板，管理端点需面板密码（首次登录后务必修改，勿用默认值））
   - 账号：桌面 App `auth.v1.dat` 导入（两步确认：扫描→导入），CN 区主账号

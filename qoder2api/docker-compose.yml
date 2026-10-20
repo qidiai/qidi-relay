@@ -1,0 +1,38 @@
+services:
+  qoder-proxy:
+    # 默认使用官方预构建镜像（每个版本自动构建并推送多架构 amd64/arm64 到 GHCR）。
+    # 想从源码自行构建：注释掉下面这行 image，改用 build: .
+    image: ghcr.io/shuishuipingan/qoder2api-hub:latest
+    # build: .
+    container_name: qoder-proxy
+    restart: unless-stopped
+    # 固定网卡 MAC（**可选，默认关闭**）：bridge 网络下容器停止会重建 veth，设备身份随之变化。
+    # 但 v1.2.13 起网关默认启用「机器身份落盘缓存」：只要 accounts/ 是挂载卷，
+    # **重启 / 重建 / 升级都不会再换设备身份** —— 所以通常**不需要**这一行。
+    # 只在「不挂载 accounts/」或「希望组件调用本身也稳定」时才需要固定它。
+    # ⚠️ 要用的话请换成你自己生成的，别照抄——macvlan / 同一宿主机多实例会撞 MAC：
+    #    printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
+    # mac_address: "02:42:ac:11:00:77"
+    ports:
+      # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改
+      - "8790:8790"
+    environment:
+      # HOST/PORT 真实生效：镜像 CMD 不再硬编码 --host/--port（argparse 读环境变量）
+      - HOST=0.0.0.0
+      - PORT=8790
+      # - API_KEY=your_api_key_here
+      # ↑ 留空：容器以 --lan 启动，首次自动生成随机 Key 写入 ./accounts/settings.json
+      #   并打印在日志（docker compose logs qoder-proxy | grep -i "api key"）
+      - TZ=Asia/Shanghai
+    volumes:
+      # 持久化挂载账号凭证与用量流水
+      # NAS / 长期部署建议改成绝对路径，避免源码目录被重装覆盖时连数据一起删掉
+      - ./accounts:/app/accounts
+      - ./usage:/app/usage
+    healthcheck:
+      # 跟随 PORT 环境变量（与镜像内 HEALTHCHECK 同语义），改容器端口不用同步改这里
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8790'),timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

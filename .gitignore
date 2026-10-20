@@ -43,3 +43,9 @@ cooldowns.json
 # multi-suffix logs (proxy.log.3 etc.)
 *.log.*
 _tmp_*.txt
+
+# qoder2api vendored bridge runtime data
+qoder2api/accounts/
+qoder2api/__pycache__/
+qoder2api/*.log
+qoder2api/*.pid
