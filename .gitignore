@@ -49,3 +49,7 @@ qoder2api/accounts/
 qoder2api/__pycache__/
 qoder2api/*.log
 qoder2api/*.pid
+
+# antigravity bridge local secrets
+antigravity_key.txt
+antigravity2api.log
