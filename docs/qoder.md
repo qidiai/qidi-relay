@@ -9,9 +9,9 @@
 
 - **桥**：`G:\程序开发\qoder2api-audit`（MIT，零依赖，Python 3.9+）
   - 启动：计划任务 `qoder2api`（开机自启，`run-qoder-proxy.vbs` wscript  detached）
-  - 端口 8790（`/v1` OpenAI 兼容 + `/` 面板，管理端点需面板密码，默认 `admin`）
-  - 账号：桌面 App `auth.v1.dat` 导入（两步确认：扫描→导入），CN 区
-    `[REDACTED-NICK]`（17 天有效，refresh token 自动续期）
+  - 端口 8790（`/v1` OpenAI 兼容 + `/` 面板，管理端点需面板密码（首次登录后务必修改，勿用默认值））
+  - 账号：桌面 App `auth.v1.dat` 导入（两步确认：扫描→导入），CN 区主账号
+    （昵称/uid 已脱敏；17 天有效，refresh token 自动续期）
 - **中转侧**：`providers.qoder`（base_url `http://127.0.0.1:8790/v1`）
   - 模型统一 `qoder/` 前缀（go/ zynk/ 先例，防与主池/竞对渠道大小写撞名）
   - `model_aliases` 还原桥侧显示名（大小写敏感，如 `qoder/GLM-5.3`→`GLM-5.3`）
