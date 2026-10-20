@@ -86,7 +86,7 @@ schtasks /delete /f /tn "minicode-checkin"
 **小时级短时效 + refresh_token 轮换 + 切换登录可吊销**——快照账号能否
 长期存活取决于使用纪律：
 
-1. **登录后立即快照**：mcode 登录该账号后马上 `python _qidi_tmp_save_account.py`
+1. **登录后立即快照**：mcode 登录该账号后马上 `python minicode\save_account.py`
    （或让我跑），把当时的 refresh_token 落进快照文件；
 2. **快照后不再动它**：不要再在该账号下使用 mcode 客户端/登录登出——
    客户端轮换或登出会吊销 refresh_token，快照立刻失效（`invalid_grant`）；
