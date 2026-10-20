@@ -39,6 +39,9 @@ LOG_FILE = os.path.join(BASE, "antigravity2api.log")
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 PROXY_URL = "socks5://127.0.0.1:1080"
 PORT = 8791
+# 版本标记（2026-10-21 加）：/health 返回、启动日志打印 —— 用来确认台式机
+# 换版时旧进程是否真的被杀掉（Python 不热重载，2016 教训）。
+BUILD = "2026-10-21a"
 RETRIES = 4
 MODELS = ["antigravity-preview-latest",
           "antigravity-preview-09-2026",
@@ -135,7 +138,7 @@ app = Flask(__name__)
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "antigravity2api",
-                    "has_key": bool(api_key())})
+                    "build": BUILD, "has_key": bool(api_key())})
 
 
 @app.get("/v1/models")
@@ -265,4 +268,5 @@ def chat():
 
 
 if __name__ == "__main__":
+    log("bridge start build=%s port=%s proxy=%s" % (BUILD, PORT, PROXY_URL))
     app.run(host="127.0.0.1", port=PORT, threaded=True)
