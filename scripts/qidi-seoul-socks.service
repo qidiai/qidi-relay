@@ -1,0 +1,23 @@
+[Unit]
+Description=Qidi Seoul SOCKS5 egress (cloud -> Seoul VPS)
+# 用途：云端 VPS 直连 Google 不通（实测 8s 超时），到首尔 VPS 的 22 端口可达。
+# 本服务在 127.0.0.1:1080 提供 SOCKS5，relay 的 gs 渠道用
+# proxy_url=socks5://127.0.0.1:1080 即可直出首尔（Gemini / Google API）。
+# 部署：sudo install -m 755 scripts/seoul_socks.py /usr/local/bin/qidi-seoul-socks.py
+#       sudo install -m 600 scripts/seoul.env.example /etc/qidi-seoul.env  # 填口令
+#       sudo cp scripts/qidi-seoul-socks.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now qidi-seoul-socks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/qidi-seoul.env
+ExecStart=/usr/bin/python3 /usr/local/bin/qidi-seoul-socks.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
