@@ -24,6 +24,10 @@
     "rebind_on": "default"
   },
   "_routing_说明": "路由/绑定策略（吸收-1/2 §R-D）。rebind_on：会话粘性的失败重绑档位。\"default\"（缺省）= 现状零改动——成功者覆写绑定、失败一律不动绑定（失败后原绑定保留，下请求粘回原号；401/402/403 经冷却窗口事实性临时不粘、冷却到期又粘回）；\"quota\" = CPA 语义分级——transient 失败（读超时/连接重置/5xx/空流/截断/无内容超时）本次换号但**保持**绑定（保 prompt cache），hard 失败（401/402/403/429/404/inband 4xx/budget_exhausted/OAuth invalid_grant）**持久清除**绑定换号，且只有『命中绑定账号且成功』才覆写绑定（failover 到非绑定账号成功时不覆写）。失败面×归类完整映射见 proxy_core/classify_failure.py 模块文档。面板观测：GET /api/affinity/stats 的 rebind_distribution 计数（默认档恒空——零动作语义）。本子树与既有的 routing.economy（经济路由，见 proxy_core/router.py）并列共存、互不覆盖。",
+  "model_fallbacks": {
+    "例子-旗舰模型": ["例子-备用模型"]
+  },
+  "_model_fallbacks_说明": "模型兜底（2026-10-21 方案 C）。key = 请求模型名，value = 备用模型数组（按顺序尝试，最多 3 跳）。仅在上游返回 401/402/403/429/503（凭证失效 / 额度耗尽 / 全 key 不可用）时降级；400/404/422 等请求形态错误不降级（换模型救不了，还会掩盖客户端 bug）。备用必须是 providers 里已配置的外部模型（池模型不参与——那条路要重建账号池/分组语义，风险大于收益）。每次降级写日志 + 面板 activity（status=fallback），响应体 model 字段为实际服务的模型，不做静默改写（0906 审计原则）。显式跨族末位（如 Qwen→DeepSeek）需自行确认可接受。",
   "providers": {
     "示例-静态key直转-可删": {
       "base_url": "https://api.任意OpenAI兼容服务.com/v1",

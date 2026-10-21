@@ -226,16 +226,20 @@ def test_upstream_models_connect_error_ok_false(client):
     assert "连接" in d["error"]
 
 
-@pytest.mark.parametrize("pname", ["atomcode", "cline", "minicode", "ocserve"])
+@pytest.mark.parametrize("pname", ["atomcode", "minicode", "ocserve"])
 def test_special_channel_unsupported(client, pname):
-    """特殊渠道（无静态 key/上游结构不同）→ 明确错误且不发请求。"""
+    """特殊渠道（签名/非 OpenAI 协议）→ 明确错误且不发请求。
+
+    cline 自 T22（2026-10-20）起有独立的上游列表通道（OAuth token + 指纹头
+    拉 api.cline.bot/api/v1/models），不再属于"不支持"集合，故从参数里移除。
+    """
     c, _ = client
     _ModelsClient.reset()
     r = c.get(f"/api/providers/{pname}/models/upstream")
     assert r.status_code == 200
     d = r.get_json()
     assert d["ok"] is False
-    assert d["error"] == "该渠道类型不支持列表刷新"
+    assert "无 OpenAI 兼容上游列表" in d["error"]
     assert _ModelsClient.calls == []
 
 

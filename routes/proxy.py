@@ -1326,7 +1326,8 @@ def _proxy_chat(data: dict, upstream_path: str = "/v1/chat/completions", transfo
             log.warning("视觉回落: 外部视觉模型全挂，降级到 codely-vl（账号池）")
             # 不 return，让它走下面的账号池路径
         else:
-            return _forward_external(data, model, prov)
+            # 2026-10-21：额度/凭证类失败按 config.model_fallbacks 降级
+            return _forward_with_fallbacks(data, model, prov)
 
     # ── System Prompt 守卫 ──────────────────────────────────────
     # 上游会检测 system prompt 内容，非官方 CLI 的系统提示词会触发 400。
@@ -3179,6 +3180,61 @@ def _forward_external(data: dict, model: str, prov: dict):
                      tokens=0, status="异常")
         kdb.record_error(pname, model, 502, "external_exception", str(e)[:200])
         return jsonify({"error": f"{pname} 请求失败: {e}"}), 502
+
+
+# ── 模型兜底（2026-10-21，方案 C：额度打光自动降级）────────────────────────
+# 触发面刻意收窄到「换模型能救」的凭证/额度类失败：
+#   401/403 凭证失效、402/429 额度耗尽、503 全 key 不可用。
+# 请求形态类 4xx（400/404/422）**不兜底**——换模型救不了，还会掩盖客户端 bug。
+# 纪律：兜底必须是 config.model_fallbacks 显式配置；每次切换写日志 +
+# 面板 activity（status="fallback"）；响应体 model 字段为实际服务的模型
+# ——不做静默改写（0906 审计「绝不静默改写假活」原则）。
+_FALLBACK_TRIGGER_STATUS = frozenset({401, 402, 403, 429, 503})
+_MAX_FALLBACK_DEPTH = 3
+
+
+def _resp_status(resp):
+    """统一取状态码：覆盖 (body, status) 元组与 Response 两种返回形态。"""
+    if isinstance(resp, tuple) and len(resp) == 2 and isinstance(resp[1], int):
+        return resp[1]
+    return getattr(resp, "status_code", None)
+
+
+def _forward_with_fallbacks(data: dict, model: str, prov: dict,
+                            seen=None, depth: int = 0):
+    """外部通道转发；命中额度/凭证类失败时按 config.model_fallbacks 降级。
+
+    只降级到**外部 provider 模型**（providers.match 命中）。池模型不在兜底
+    范围内：那条路要重建请求语义（账号池、分组、经济路由），风险远大于收益。
+    """
+    resp = _forward_external(data, model, prov)
+    if depth >= _MAX_FALLBACK_DEPTH:
+        return resp
+    if _resp_status(resp) not in _FALLBACK_TRIGGER_STATUS:
+        return resp
+    chain = (load_config().get("model_fallbacks") or {}).get(model) or []
+    if not isinstance(chain, list):
+        log.warning("模型兜底: model_fallbacks[%s] 不是数组，忽略", model)
+        return resp
+    seen = set(seen or ()) | {model}
+    for alt in chain:
+        if not isinstance(alt, str) or not alt.strip() or alt in seen:
+            continue
+        alt = alt.strip()
+        alt_prov = providers.match(alt)
+        if not alt_prov:
+            log.warning("模型兜底: %s 的备用 %r 不是可用外部通道，跳过", model, alt)
+            continue
+        log.warning("模型兜底: %s 失败(%s) → 切 %s", model, _resp_status(resp), alt)
+        activity.add("warn", f"模型兜底 {model} → {alt}", model=alt,
+                     status="fallback")
+        alt_data = dict(data)
+        alt_data["model"] = alt
+        r2 = _forward_with_fallbacks(alt_data, alt, alt_prov, seen, depth + 1)
+        if _resp_status(r2) not in _FALLBACK_TRIGGER_STATUS:
+            return r2
+        resp = r2
+    return resp
 
 
 @bp.route("/v1/chat/completions", methods=["POST"])
