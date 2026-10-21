@@ -1104,14 +1104,14 @@ def test_external_provider_quota_cooldown():
         assert r2.status_code == 503, r2.status_code
         assert r2.headers.get("Retry-After")
         assert len(HITS) == 2                    # 冷却窗内零上游请求
-        RP._prov_quota_cooldown["mockprov"] = time.time() - 1   # 模拟窗口过期
+        RP._prov_quota_cooldown["mockprov|mp-model"] = time.time() - 1   # 模拟窗口过期
         BEHAVIOR.update({"kA": "200", "kB": "200"})
         assert _post_mp().status_code == 200
-        assert "mockprov" not in RP._prov_quota_cooldown   # 成功即解除冷却
+        assert "mockprov|mp-model" not in RP._prov_quota_cooldown   # 成功即解除冷却
     finally:
         cfg["providers"] = old_provs
         S.CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-        RP._prov_quota_cooldown.pop("mockprov", None)
+        RP._prov_quota_cooldown.pop("mockprov|mp-model", None)
 
 
 def test_affinity_feature_off_leaves_no_memory():

@@ -386,9 +386,9 @@ def test_proxy_read_point_warms_up_from_store(env):
     import routes.proxy as RP
     from flask import Flask
 
-    CS.set_provider("warmprov", time.time() + 900)
+    CS.set_provider("warmprov|m", time.time() + 900)
     assert CS.persist() is True
-    RP._prov_quota_cooldown.pop("warmprov", None)          # 模拟重启内存空
+    RP._prov_quota_cooldown.pop("warmprov|m", None)          # 模拟重启内存空
 
     prov = {"name": "warmprov", "base_url": "http://127.0.0.1:1/v1",
             "keys": [{"key": "k", "label": "l"}], "models": ["m"]}
@@ -399,6 +399,42 @@ def test_proxy_read_point_warms_up_from_store(env):
             "m", prov)
     assert r.status_code == 503
     assert r.get_json()["error"]["code"] == "provider_quota_cooldown"
-    assert "warmprov" in RP._prov_quota_cooldown            # 已回灌内存表
-    RP._prov_quota_cooldown.pop("warmprov", None)
+    assert "warmprov|m" in RP._prov_quota_cooldown          # 已回灌内存表（按模型键）
+    RP._prov_quota_cooldown.pop("warmprov|m", None)
 
+
+
+# ─── 模型级冷却隔离（2026-10-21）──────────────────────────────────────
+
+def test_quota_cooldown_is_per_model():
+    """同一 provider 下 A 模型冷却，B 模型必须照常打上游。
+
+    背景：Gemini 4 Argon 未开通付费额度时上游返回 429，旧的 provider 级冷却
+    会把同一把 key 下可用的 gemini-3.7/3.8-flash 一并锁死 15 分钟。
+    """
+    import routes.proxy as RP
+    from flask import Flask
+
+    cd_a = RP._quota_cd_key("mp", "m-a")
+    assert cd_a != RP._quota_cd_key("mp", "m-b")      # 键必须按模型区分
+    RP._prov_quota_cooldown[cd_a] = time.time() + 900
+
+    prov = {"name": "mp", "base_url": "http://127.0.0.1:1/v1",
+            "keys": [{"key": "k", "label": "l"}], "models": ["m-a", "m-b"]}
+    app = Flask(__name__)
+    try:
+        with app.test_request_context("/v1/chat/completions"):
+            r_a = RP._forward_external(
+                {"model": "m-a", "messages": [{"role": "user", "content": "hi"}]},
+                "m-a", prov)
+            r_b = RP._forward_external(
+                {"model": "m-b", "messages": [{"role": "user", "content": "hi"}]},
+                "m-b", prov)
+        assert r_a.status_code == 503
+        assert r_a.get_json()["error"]["code"] == "provider_quota_cooldown"
+        # B 未被冷却：走到真实上游尝试（本机 1 端口拒连 → 502），而不是 503 冷却
+        st_b = r_b[1] if isinstance(r_b, tuple) else r_b.status_code
+        assert st_b != 503, "B 模型不应被 A 模型的冷却波及"
+    finally:
+        RP._prov_quota_cooldown.pop(cd_a, None)
+        RP._prov_quota_cooldown.pop(RP._quota_cd_key("mp", "m-b"), None)
