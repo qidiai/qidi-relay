@@ -18,6 +18,7 @@ from proxy_core import settings
 from proxy_core.settings import LOG_FILE, VERSION, get_port, load_config
 from proxy_core.state import am  # noqa: F401  (导入即初始化单例)
 from routes.admin import bp as admin_bp
+from routes.media import bp as media_bp
 from routes.proxy import bp as proxy_bp
 
 # 日志异步化（0831 卡死根因修复）：
@@ -53,6 +54,7 @@ app = Flask(
 )
 app.register_blueprint(proxy_bp)
 app.register_blueprint(admin_bp)
+app.register_blueprint(media_bp)
 
 
 @app.route("/")

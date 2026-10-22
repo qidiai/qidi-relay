@@ -68,6 +68,24 @@
       ],
       "_api_keys_说明": "字符串与对象元素可混用（自动去重合并）。disabled=true 的 key 保留在池中但不参与选号，面板显示'已停用'，额度重置后面板一键启用（F14）。weight=凭证权重（缺省 1）：选择公式 effective_load = 进行中请求数 / weight，取最低者——weight 越大越优先被选中（主力号可设 2/3），**是负载除数而非绝对比例**；weight=0 = 软停用（不参与选号，与 disabled 并存时 disabled 优先）；负数→0、超 1000→1000、字符串 \"2\"→2（越界/非法时逐 key 一次性告警）。与『同一 key 重复出现 = 更高选中权重』机制并存（后者是简单轮换偏置，前者是负载感知的除数）。面板对该 key 显示『权重 N』徽章（与『已停用』徽章区分）。"
     },
+    "示例-媒体RPM限流-可删": {
+      "base_url": "https://api.agnes-ai.cn/v1",
+      "api_keys": [
+        "sk-主号",
+        {
+          "key": "sk-备用号",
+          "label": "备用"
+        }
+      ],
+      "models": [
+        "agnes-image-2.5-flash",
+        "agnes-video-2.5-flash"
+      ],
+      "rpm": 10,
+      "key_cooldown_s": 60,
+      "_rpm_说明": "媒体透传路由（POST /v1/images/generations、POST /v1/videos、GET /agnesapi）专用的 per-key RPM 限流（每分钟请求数）。缺省或 0 = 不限制。调度器按 60 秒滑动窗口统计，达到上限后该 key 被跳过；上游 429 时额外触发 key_cooldown_s 冷却（缺省 60 秒），冷却期内 pick 直接跳过。",
+      "_key_cooldown_s_说明": "上游返回 429 时给该 key 记的冷却秒数（缺省 60）。冷却期内媒体调度器跳过该 key；冷却到期后自动恢复。"
+    },
     "示例-Go网关直连-可删": {
       "base_url": "https://opencode.ai/zen/go/v1",
       "api_keys": [
