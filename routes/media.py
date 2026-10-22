@@ -61,6 +61,75 @@ def _openai_error_body(message: str, err_type: str, code: str, status: int = 404
     return resp
 
 
+# ── 错误码归一化（2026-10-22）────────────────────────────────
+# 依据 Agnes 官方 docs/ERROR_CODES.md：上游的错误语义与 OpenAI 并不完全一致
+# （例如 401 表示「我们配置的 provider key 失效」，对客户端应是网关错误 502，
+# 而不是 401 让客户端怀疑自己的 key）。这里做一层收敛，同时**保留原始信息**
+# 在 error.upstream 里，便于排查且不做静默改写。
+_UPSTREAM_ERROR_MAP = {
+    400: (400, "invalid_request_error", "invalid_request_error"),
+    401: (502, "provider_error", "provider_auth_failed"),
+    402: (502, "provider_error", "provider_quota_exceeded"),
+    403: (502, "provider_error", "provider_access_denied"),
+    404: (404, "invalid_request_error", "model_or_task_not_found"),
+    429: (429, "rate_limit_error", "key_rate_limited"),
+    500: (502, "provider_error", "provider_internal_error"),
+    503: (502, "provider_error", "provider_unavailable"),
+}
+
+
+def normalize_upstream_error(status: int, body: bytes) -> tuple:
+    """把上游错误体归一化为 OpenAI 风格。
+
+    Returns:
+        (out_status, out_body_bytes, out_content_type)
+
+    规则：
+    - status < 400 → 原样返回
+    - 非 JSON 体 → 原样返回（不做臆测解析）
+    - JSON 体 → 输出
+      ``{"error": {"message","type","code","upstream": {"status","code","message"}}}``
+      其中 ``upstream`` 保留 Agnes 原始 code/message；对外状态码按上表收敛
+      （401/402/403/5xx → 502，避免误导客户端）。
+    """
+    if status < 400:
+        return status, body, "application/json"
+
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return status, body, "application/json"
+
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        return status, body, "application/json"
+
+    orig_code = err.get("code")
+    orig_msg = err.get("message") or ""
+
+    if status == 404 and isinstance(orig_msg, str) and "任务不存在" in orig_msg:
+        out_status, err_type, code = 404, "invalid_request_error", "task_not_found"
+    else:
+        out_status, err_type, code = _UPSTREAM_ERROR_MAP.get(
+            status, (502 if status >= 500 else status, "provider_error", "upstream_error"))
+
+    normalized = {
+        "error": {
+            "message": orig_msg or ("upstream returned %d" % status),
+            "type": err_type,
+            "param": None,
+            "code": code,
+            "upstream": {
+                "provider": "agnes",
+                "status": status,
+                "code": orig_code,
+                "message": orig_msg,
+            },
+        }
+    }
+    return out_status, json.dumps(normalized, ensure_ascii=False).encode("utf-8"), "application/json"
+
+
 def _model_not_found_response(model: str) -> Response:
     """未知模型 404（与 chat 的 model_not_found 风格一致）。"""
     return _openai_error_body(
@@ -208,7 +277,9 @@ def _forward_media(
         ct = resp.headers.get("Content-Type") or "application/json"
         resp_body = resp.content
         resp.close()
-        return Response(resp_body, status=status, content_type=ct)
+        # 错误码归一化（成功/非 JSON 原样透传）
+        out_status, out_body, out_ct = normalize_upstream_error(status, resp_body)
+        return Response(out_body, status=out_status, content_type=out_ct)
 
     # 所有 key 都 429（或全异常）
     if last_resp is not None and last_resp.status_code == 429:
